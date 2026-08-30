@@ -1,0 +1,1682 @@
+//@version=6
+
+// Version
+string VERSION = "V3"
+indicator("SLT-light " + VERSION, overlay = true, max_labels_count = 300)
+
+// By: @dmandrey
+//
+// These methodologies are educational references and do not guarantee any specific trading results.
+
+//======================================================================
+// CONSTANTS
+//======================================================================
+// Stretch Factor penalties
+const int STRETCH_MODERATE_PENALTY = 10   // Stretched but not extreme
+const int STRETCH_EXTREME_PENALTY = 20    // High extension risk
+const int FUEL_PENALTY = 25
+const int SQUEEZE_PENALTY = 30
+const int LIQUIDITY_PENALTY = 25
+
+// DASHBOARD
+const string DASH_WIDTH = "                                        "
+// Sized to leave 6 row slots before the break guard for the
+// variable-length gate-details loop below.
+const int DASHBOARD_MAX_ROWS = 28
+
+//======================================================================
+// TYPES
+//======================================================================
+// Pine arrays cannot directly hold other arrays (no array<array<float>>),
+// so a completed session's per-slot volume history is wrapped in a UDT.
+type TodSession
+    array<float> vols
+
+//======================================================================
+// INPUTS
+//======================================================================
+
+
+//======================================================================
+// SIGNAL ANCHOR SELECTION
+//======================================================================
+grp_anchor = "📍 Signal Anchor"
+anchorMode = input.string("EMA Cross", "Signal Anchor",
+     options = ["EMA Cross", "SMA"],
+     group = grp_anchor,
+     tooltip = "EMA CROSS:\n" +
+               "• Signals on EMA9 crossing slow EMA\n" +
+               "• Faster entries, catches early momentum\n" +
+               "• More responsive to price action\n" +
+               "• Best for: NVDA, TSLA (fast movers), aggressive trading\n\n" +
+               "SMA:\n" +
+               "• Signals on price crossing a slow structural SMA\n" +
+               "• Slowest anchor — filters out intraday noise entirely\n" +
+               "• ATR buffer band + latched state kills whipsaw\n" +
+               "• Best for: choppy instruments, fewer/higher-conviction entries\n\n" +
+               "NOTE: Both use the same scoring/gates for quality filtering")
+
+// EMA Period Selection (only applies to EMA Cross mode)
+emaSlowPeriod = input.int(30, "EMA Slow Period",
+     options = [20, 30],
+     group = grp_anchor,
+     tooltip = "Select slow EMA period for EMA Cross mode:\n\n" +
+               "EMA 9/20 (Faster):\n" +
+               "• Very responsive, more signals (5-10/session)\n" +
+               "• Catches early momentum and breakouts\n" +
+               "• Higher whipsaw risk in choppy markets\n" +
+               "• Best for: NVDA, TSLA (fast movers)\n" +
+               "• Observed: SOXX 74% BUY / 54% SELL\n\n" +
+               "EMA 9/30 (Default — Smoother):\n" +
+               "• More selective, fewer signals (3-7/session)\n" +
+               "• Better trend filtering, rides moves longer\n" +
+               "• Lower whipsaw risk (-40% reduction)\n" +
+               "• Best for: SOXX, Silver, SPY/QQQ\n" +
+               "• Expected: Better SELL win rates (+5-10%)\n\n" +
+               "NOTE: Only applies when 'Signal Anchor' = EMA Cross")
+
+
+//======================================================================
+// SMA ANCHOR SETTINGS (only used when Signal Anchor = SMA)
+//======================================================================
+grp_sma = "📉 SMA Anchor"
+smaMode = input.string("AUTO", "SMA Length Mode",
+     options = ["AUTO", "MANUAL"],
+     group = grp_sma,
+     tooltip = "AUTO: SMA length set per asset profile\n" +
+               "• STOCK: 70\n" +
+               "• ETF / FUND: 90\n" +
+               "• FUTURES: 70\n" +
+               "• CRYPTO: 120\n" +
+               "• MARKET INDEX: 90\n\n" +
+               "MANUAL: use the Manual SMA Length below")
+
+smaLen_manual = input.int(70, "Manual SMA Length", minval = 10, maxval = 300, group = grp_sma,
+     tooltip = "Only used when SMA Length Mode = MANUAL\n" +
+               "70 on a 2-min chart ≈ 2.3 hours of price")
+
+smaBufferATR = input.float(0.25, "SMA Buffer (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05,
+     group = grp_sma,
+     tooltip = "Neutral band around the SMA, measured in ATR(14).\n\n" +
+               "Bull latches only when close > SMA + buffer.\n" +
+               "Bear latches only when close < SMA - buffer.\n" +
+               "Inside the band the previous state is held (hysteresis).\n\n" +
+               "0.0 = raw price/SMA cross (noisy — many flips per session)\n" +
+               "0.25 = default, filters most chop\n" +
+               "0.50+ = very few flips, later entries")
+
+//======================================================================
+// SIGNAL SETTINGS
+//======================================================================
+grp_sig = "Signal & Risk Management"
+showLabels = input.bool(true, "Show BUY/SELL Labels", group = grp_sig,
+     tooltip = "Display BUY/SELL labels on chart when signals fire")
+sigTime = input.string("Score", "Signal Timing", options = ["Trend", "Score"], group = grp_sig,
+     tooltip = "Trend: Fire at every anchor flip\nScore: Fire only when score ≥ minimum")
+sigQuality = input.string("⭐ +", "Signal Quality Filter", 
+     options = ["All Signals", "⭐ +", "⭐⭐ +", "⭐⭐⭐ Only"], 
+     group = grp_sig,
+     tooltip = "Filter which quality signals to display:\n" +
+               "• All Signals: Show all (including ⚠️ WEAK)\n" +
+               "• ⭐ GOOD+: Show GOOD, STRONG, EXCELLENT\n" +
+               "• ⭐⭐ STRONG+: Show STRONG, EXCELLENT\n" +
+               "• ⭐⭐⭐ EXCELLENT Only: Show only top-tier setups")
+
+minScoreBuy= input.int(50, "Min Score for BUY Signal", minval = 0, maxval = 70, group = grp_sig,
+     tooltip = "Minimum score required for BUY label (Score mode only)\nMax 70 to allow ⭐⭐⭐ EXCELLENT rating (threshold + 30)")
+
+minScoreSell= input.int(50, "Min Score for SELL Signal", minval = 0, maxval = 70, group = grp_sig,
+     tooltip = "Minimum score required for SELL label (Score mode only)\nMax 70 to allow ⭐⭐⭐ EXCELLENT rating (threshold + 30)")
+
+// Entry freshness constraint (Score mode only)
+maxBarsFromFlip = input.int(0, "Max Bars From Flip (Score mode)", minval = 0, maxval = 50, group = grp_sig,
+     tooltip = "SCORE MODE ONLY — Trend mode is unaffected (it already fires on the\n" +
+               "flip bar by definition).\n\n" +
+               "0 (default): Disabled — Score mode can fire on any bar the score\n" +
+               "clears the threshold, no matter how far past the anchor flip.\n\n" +
+               "1-50: Score-mode signals only fire within this many bars of the\n" +
+               "most recent trendUp/trendDown flip. Prevents entries deep into an\n" +
+               "already-extended move (the Stretch gate catches this too, but only\n" +
+               "when Enable Risk Gates = true — this works independent of that).\n\n" +
+               "Calibrate using 'Bars From Flip' in Extended Metrics.")
+
+useSessionFilter = input.bool(true, "RTH Session Filter (9:30–4:00 PM ET)", group = grp_sig,
+     tooltip = "Only fire signals during regular trading hours (9:30 AM – 4:00 PM ET, Mon–Fri).\n\n" +
+               "When ON: Signals are suppressed outside market hours.\n" +
+               "State resets at session open so the first RTH bar can fire\n" +
+               "freely without carryover from overnight.")
+
+gateOn = input.bool(true, "Enable Risk Gates", group = grp_sig,
+     tooltip = "ENFORCEMENT MODE (ON, default): Gates apply penalties to score\n" +
+               "ADVISORY MODE (OFF): Gates show warnings but don't affect score\n\n" +
+               "RISK GATES ARE ALWAYS VISIBLE:\n" +
+               "• ON → 'Gates: 🚧 SQUEEZE (-30)'\n" +
+               "• OFF → 'Risks: 🚧 SQUEEZE (-30)'\n\n" +
+               "RISK GATES (4 total - pure risk filters):\n" +
+               "1. Squeeze: -30 when BB inside KC (range-bound)\n" +
+               "2. Stretch: -10/-20 when price extended from EMA20 or flip\n" +
+               "3. ATR Fuel: -25 when session range exceeds the profile's\n" +
+               "   fuel limit (75-95% of daily ATR-14, asset-dependent)\n" +
+               "4. Liquidity: -25 when RVOL is below the profile's RVOL\n" +
+               "   gate (0.6-1.2x, asset-dependent) AND ADX is choppy\n\n" +
+               "Default ON: Gates 1 (Squeeze) and 4 (Liquidity) directly\n" +
+               "suppress the low-ADX/range-bound chop entries that drove\n" +
+               "losing whipsaw signals in backtesting (see roadmap.md).\n\n" +
+               "NOTE: Breakout bonus moved to Component 5 (always active)")
+
+rvolMode = input.string("Time-of-Day", "Relative Volume Mode",
+     options = ["Rolling 20-bar", "Time-of-Day"],
+     group = grp_sig,
+     tooltip = "ROLLING 20-BAR:\n" +
+               "• Compares volume to the trailing 20-bar SMA\n" +
+               "• On a 2-min chart this is a 40-minute trailing average\n" +
+               "• Biased: overstates RVOL near the open, understates it at lunch\n\n" +
+               "TIME-OF-DAY (default):\n" +
+               "• Compares volume to the SAME intraday bar-slot's average\n" +
+               "  volume across the prior 'RVOL Lookback Sessions'\n" +
+               "• Removes the U-shaped intraday volume bias\n" +
+               "• Falls back to Rolling 20-bar automatically when fewer than\n" +
+               "  3 historical sessions exist at that slot (new listings,\n" +
+               "  short chart history)")
+
+rvolLookbackDays = input.int(10, "RVOL Lookback Sessions", minval = 3, maxval = 20, group = grp_sig,
+     tooltip = "Number of prior sessions averaged per intraday bar-slot for\n" +
+               "Time-of-Day RVOL mode. Only used when Relative Volume Mode = Time-of-Day.")
+
+grp_pnl = "💰 P&L Exit Signals"
+enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
+     tooltip = "Track and display PROFIT/LOSS exit signals when price moves ±target% from entry")
+pnlTarget = input.float(1.0, "P&L Target (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = grp_pnl,
+     tooltip = "Exit signal fires at ±this percentage. Default: 1.0%")
+
+showSignalPnL = input.bool(true, "📊 Show Signal P&L History", group = grp_pnl,
+     tooltip = "Display actual % gain/loss between consecutive signals.\n\n" +
+               "HOW IT WORKS:\n" +
+               "• Calculates P&L from previous signal (any direction)\n" +
+               "• BUY→BUY: Long gain/loss\n" +
+               "• SELL→SELL: Short gain/loss\n" +
+               "• BUY→SELL or SELL→BUY: Position reversal P&L\n\n" +
+               "WHAT IT'S FOR:\n" +
+               "• See incremental value of each signal\n" +
+               "• Identify whipsaw periods (red P&Ls)\n" +
+               "• Validate signal timing effectiveness\n\n" +
+               "INDEPENDENT FROM:\n" +
+               "• Live dashboard P&L (tracks current position)\n" +
+               "• PROFIT/LOSS exit signals (±target %)")
+
+grp_success = "📊 Success Rate Tracking"
+enableSuccessRate = input.bool(true, "Enable Success Rate Tracking", group = grp_success,
+     tooltip = "Track win/loss statistics for BUY and SELL signals\n\n" +
+               "DISPLAYS:\n" +
+               "• Separate BUY and SELL win rates\n" +
+               "• Raw counts (e.g., '65.4% [17/26]')\n" +
+               "• Color-coded performance (Green/Yellow/Red)\n\n" +
+               "LOCATION:\n" +
+               "• Dashboard Extended Metrics section\n" +
+               "• Only visible when Extended Metrics enabled\n\n" +
+               "BENEFITS:\n" +
+               "• Validate parameter changes objectively\n" +
+               "• Detect directional bias (BUY vs SELL)\n" +
+               "• Monitor system performance over time")
+
+maxSignalsToTrack = input.int(50, "Max Signals to Track", minval = 10, maxval = 500, step = 10, group = grp_success,
+     tooltip = "Rolling window: Track success rate over last N signals\n\n" +
+               "SMALLER VALUES (10-50):\n" +
+               "• More responsive to recent performance\n" +
+               "• Shows current market regime\n" +
+               "• Higher volatility in rates\n\n" +
+               "LARGER VALUES (100-500):\n" +
+               "• More stable long-term statistics\n" +
+               "• Less affected by temporary fluctuations\n" +
+               "• Better for overall system evaluation\n\n" +
+               "RECOMMENDED:\n" +
+               "• Day Trading: 50-100 signals\n" +
+               "• Swing Trading: 100-200 signals\n" +
+               "• System Validation: 200-500 signals")
+
+grp_vis = "Dashboard & Visuals"
+showDash = input.bool(true, "Show Dashboard", group = grp_vis)
+extDash  = input.bool(true, "Extended Metrics", group = grp_vis,
+     tooltip = "Show detailed point breakdown for each component")
+showCircles = input.bool(true, "Show Trend Flip Circles", group = grp_vis)
+showBg   = input.bool(true, "Show Trend Background", group = grp_vis)
+
+
+//======================================================================
+// ASSET DETECTION & PROFILE ASSIGNMENT
+//======================================================================
+// 1. Core Detection using syminfo.type
+string asset_category = switch syminfo.type
+    "stock"   => "STOCK"
+    "fund"    => "FUND"
+    "futures" => "FUTURES"
+    "crypto"  => "CRYPTO"
+    =>           "MARKET" // Fallback for Index, Forex, or Unknown
+
+// 2. FIX #3: Initialize Threshold Variables WITHOUT 'var'
+// These are simple variables that get assigned once based on profile
+float vwap_h_limit = 1.5   // VWAP Healthy Limit (default)
+float vwap_e_limit = 3.0   // VWAP Extended Limit (default)
+float adx_min      = 22.0  // ADX Trending Floor (default)
+float rvol_gate    = 0.8   // RVOL Minimum (default)
+float ext_scale    = 2.5   // Overextension ATR Multiplier (default)
+float fuel_max     = 85.0  // ATR Fuel Limit (default)
+int   ema_max      = 20    // EMA Cascade max points (default)
+int   vwap_max     = 25    // VWAP Value max points (default)
+int   sma_len      = 70    // SMA anchor length, AUTO mode (default)
+string profile_name = "DEFAULT"
+
+// 3. Profile Assignment Logic
+if asset_category == "MARKET"
+    profile_name := "MARKET INDEX 🏦"
+    vwap_h_limit := 0.7
+    vwap_e_limit := 1.5
+    adx_min := 25.0
+    rvol_gate := 1.0
+    ext_scale := 2.0
+    fuel_max := 80.0
+    ema_max := 22    // EMA Cascade max points (default)
+    vwap_max := 23    // VWAP Value max points (default)
+    sma_len := 90     // Slower anchor — indices grind, few clean crosses
+
+else if asset_category == "FUND"
+    profile_name := "ETF / FUND 📊"
+    vwap_h_limit := 1.0
+    vwap_e_limit := 2.0
+    adx_min := 18.0
+    rvol_gate := 1.0
+    ext_scale := 2.2
+    fuel_max := 75.0
+    ema_max := 20    // EMA Cascade max points (default)
+    vwap_max := 25    // VWAP Value max points (default)
+    sma_len := 90     // Smooth trends — longer average holds structure
+
+else if asset_category == "STOCK"
+    profile_name := "STOCK 🚀"
+    vwap_h_limit := 1.8
+    vwap_e_limit := 3.5
+    adx_min := 20.0
+    rvol_gate := 1.2
+    ext_scale := 3.0
+    fuel_max := 85.0
+    ema_max := 20    // EMA Cascade max points (default)
+    vwap_max := 25    // VWAP Value max points (default)
+    sma_len := 70     // Source-script baseline — ~2.3h on a 2-min chart
+
+else if asset_category == "FUTURES"
+    profile_name := "FUTURES ⚡"
+    vwap_h_limit := 1.5
+    vwap_e_limit := 3.0
+    adx_min := 15.0
+    rvol_gate := 0.6
+    ext_scale := 2.5
+    fuel_max := 90.0
+    ema_max := 30    // EMA Cascade max points (default)
+    vwap_max := 15    // VWAP Value max points (default)
+    sma_len := 70     // Matches the CL/crude source script this was drawn from
+
+else if asset_category == "CRYPTO"
+    profile_name := "CRYPTO 🪙"
+    vwap_h_limit := 3.0
+    vwap_e_limit := 6.0
+    adx_min := 28.0
+    rvol_gate := 0.6
+    ext_scale := 4.0
+    fuel_max := 95.0
+    ema_max := 25    // EMA Cascade max points (default)
+    vwap_max := 20    // VWAP Value max points (default)
+    sma_len := 120    // 24h trading — needs a much longer window per "session"
+
+else
+    profile_name := "STANDARD STOCK 📈" // Defaults already set above
+
+//======================================================================
+// CORE INDICATOR CALCULATIONS
+//======================================================================
+
+// Dynamic EMA calculation based on user selection
+// EMAs (9 + user-selected slow period for EMA Cross, 50 for cascade scoring)
+ema9  = ta.ema(close, 9)
+emaSlow = ta.ema(close, emaSlowPeriod)  // User choice: 20 or 30
+ema50 = ta.ema(close, 50)
+
+// Keep ema20 reference for Component 1 scoring (always uses 20)
+ema20 = ta.ema(close, 20)
+
+// SMA anchor — only drives signals when anchorMode == "SMA", but computed on
+// every bar like every other series here. AUTO takes the per-profile length
+// assigned above; MANUAL takes the user input.
+int smaLenActive = smaMode == "AUTO" ? sma_len : smaLen_manual
+smaAnchor = ta.sma(close, smaLenActive)
+
+// VWAP (Session-based - Component 2)
+vwap = ta.vwap(close)
+
+// Volatility & Momentum
+atr = ta.atr(14)
+rsiVal = ta.rsi(close, 14)
+[_, _, adx] = ta.dmi(14, 14)
+
+
+// Consolidated ADX trend detection (used by multiple components)
+bool adx_rising_3 = ta.rising(adx, 3)  // 3-bar: Velocity Override
+bool adx_rising_2 = ta.rising(adx, 2)  // 2-bar: Setup Score ADX component
+
+
+// MACD (12/26/9 standard - for Component 5 momentum alignment)
+// Only the MACD line is scored; signal/histogram are intentionally unused.
+[macdLine, _, _] = ta.macd(close, 12, 26, 9)
+
+// Relative Volume: computed after session-tracking (Time-of-Day RVOL
+// needs is_new_session, which is defined further below) — see rel_vol
+// assignment near the ATR Fuel Gauge section.
+
+//======================================================================
+// TREND EXTENSION TRACKING
+//======================================================================
+var float trend_start_price = na  // Price at anchor flip
+
+//======================================================================
+// MARKET REGIME DETECTION
+//======================================================================
+
+// 1. SQUEEZE STATE (Bollinger Bands vs Keltner Channels)
+[bbU, bbB, bbL] = ta.bb(close, 20, 2.0)
+kc_mult = 1.5
+kcU = bbB + (ta.atr(20) * kc_mult)
+kcL = bbB - (ta.atr(20) * kc_mult)
+
+bool is_squeezing = bbU <= kcU and bbL >= kcL
+bool sqz_release  = not is_squeezing and is_squeezing[1]
+
+// Squeeze breakout bias (only valid on release bar)
+string sqz_bias = sqz_release ? (close > open ? "BULL 🟢" : "BEAR 🔴") : "—"
+
+// 2. STRETCH FACTOR — unified measurement of mean-reversion risk (EMA)
+// and trend exhaustion (flip price)
+float ema_stretch = math.abs(close - ema20) / atr  // Distance from EMA20 in ATR units
+// Note: trend_stretch calculated after trend_start_price is tracked (see Gate section)
+
+// VELOCITY OVERRIDE
+// Detects high-conviction momentum that justifies exceeding standard ATR range
+bool is_high_velocity = adx > 35 and adx_rising_3
+
+//======================================================================
+// 3. ATR VOLATILITY FUEL GAUGE (Multi-Asset Session-Aware)
+//======================================================================
+
+// Track session high/low (adapts to instrument type)
+var float session_high = na
+var float session_low = na
+
+// Detect new session start. Every instrument type uses the same daily-bar
+// boundary — TradingView's "D" bars already align to each instrument's own
+// session start (midnight for stocks/ETFs/indices and crypto, ~6 PM ET for
+// futures), so no per-type branching is needed here. (This previously existed
+// as four if/else branches with identical bodies.)
+bool is_new_session = ta.change(time("D")) != 0 or na(session_high[1])
+
+// Reset or update session range
+if is_new_session
+    session_high := high
+    session_low := low
+else
+    session_high := math.max(session_high, high)
+    session_low := math.min(session_low, low)
+
+// Calculate session range (handles all session types)
+float session_range = not na(session_high) and not na(session_low) ? 
+                      session_high - session_low : 0.0
+
+// ATR Fuel: Compare intraday session range vs average daily range (14-period)
+// Uses Daily timeframe ATR with lookahead=off uses previous day's ATR, no repainting
+// This measures "% of typical daily range consumed so far today"
+float atr_14 = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead=barmerge.lookahead_off)
+
+
+// Volatility fuel used as percentage of intraday ATR
+float fuel_used = atr_14 > 0 ? (session_range / atr_14) * 100 : 0
+
+// Safety cap: Prevent extreme values due to session boundary issues
+// Max realistic value: 200% (extreme volatility day = 2x normal ATR)
+fuel_used := math.min(fuel_used, 200.0)
+
+// Exhaustion threshold (profile-specific via fuel_max)
+bool fuel_exhausted = fuel_used > fuel_max
+
+//======================================================================
+// TIME-OF-DAY RELATIVE VOLUME
+//======================================================================
+// tod_vol_history: one TodSession per completed session, indexed by
+// bar-slot-since-session-open (slot 0 = first bar of the session).
+// FIFO-capped at rvolLookbackDays completed sessions.
+var array<TodSession> tod_vol_history = array.new<TodSession>()
+var TodSession tod_current_session = TodSession.new(array.new<float>())
+var int tod_slot_idx = 0
+
+if is_new_session
+    // Finalize the just-completed session into history (skip empty first run)
+    if array.size(tod_current_session.vols) > 0
+        array.push(tod_vol_history, tod_current_session)
+        if array.size(tod_vol_history) > rvolLookbackDays
+            array.shift(tod_vol_history)
+    tod_current_session := TodSession.new(array.new<float>())
+    tod_slot_idx := 0
+
+array.push(tod_current_session.vols, volume)
+
+// Average volume at this same bar-slot across prior sessions
+float tod_vol_sum = 0.0
+int tod_vol_count = 0
+int tod_hist_sessions = array.size(tod_vol_history)
+if tod_hist_sessions > 0
+    for s = 0 to tod_hist_sessions - 1
+        TodSession tod_sess = array.get(tod_vol_history, s)
+        if tod_slot_idx < array.size(tod_sess.vols)
+            tod_vol_sum += array.get(tod_sess.vols, tod_slot_idx)
+            tod_vol_count += 1
+
+// Require at least 3 historical sessions at this slot for a meaningful average
+bool tod_data_sufficient = tod_vol_count >= 3
+float tod_vol_avg = tod_data_sufficient ? tod_vol_sum / tod_vol_count : na
+
+tod_slot_idx += 1
+
+// Relative Volume: Rolling 20-bar (always computed, used as fallback) +
+// Time-of-Day (used when selected and sufficient history exists)
+vol_ma20 = ta.sma(volume, 20)
+// The `: 1.0` fallback is what makes volume-less feeds (index symbols such as
+// TVC:NDQ or TSX:TSX, where volume is na/0) behave sanely: rel_vol becomes a
+// neutral 1.0 instead of na. Two consequences depend on that exact value —
+//   1. Component 3 awards its `>= 1.0` tier (5 pts) rather than 0.
+//   2. Gate 4 stays quiet, because `volume_is_dead` tests `rel_vol < rvol_gate`
+//      and MARKET's rvol_gate is also exactly 1.0.
+// That second one is a knife-edge tie, not a design: raising MARKET's rvol_gate
+// above 1.0 would silently pin a permanent -25 liquidity penalty on every
+// volume-less index. If you tune that value, add an explicit volume-availability
+// check here instead of relying on this fallback.
+float rel_vol_rolling = vol_ma20 > 0 ? volume / vol_ma20 : 1.0
+float rel_vol_tod = tod_data_sufficient and not na(tod_vol_avg) and tod_vol_avg > 0 ? volume / tod_vol_avg : na
+
+bool tod_rvol_active = rvolMode == "Time-of-Day" and not na(rel_vol_tod)
+rel_vol = tod_rvol_active ? rel_vol_tod : rel_vol_rolling
+string rvol_mode_label = tod_rvol_active ? "TOD" : (rvolMode == "Time-of-Day" ? "20-bar*" : "20-bar")
+
+
+//======================================================================
+// DUAL-ANCHOR TREND CLASSIFICATION
+//======================================================================
+
+// ANCHOR 1: EMA Cross (uses user-selected slow period)
+bool ema_is_bull = ema9 > emaSlow
+bool ema_is_bear = ema9 < emaSlow
+bool ema_flip_up = ta.crossover(ema9, emaSlow) and barstate.isconfirmed
+bool ema_flip_down = ta.crossunder(ema9, emaSlow) and barstate.isconfirmed
+
+// ANCHOR 2: SMA with ATR buffer band + latched state.
+//
+// A raw price/SMA cross whipsaws hard on a 2-min chart — price crosses a slow
+// average many times per session in chop, and in Trend mode trendUp fires the
+// signal directly off the flip. The buffer band (smaBufferATR x ATR-14) creates
+// a neutral zone that price must fully clear before the state changes.
+//
+// The state is LATCHED (var bool) rather than left neutral inside the band,
+// which matters downstream: several consumers are written as `is_bull ? .. : ..`
+// with no third case (dashboard trend row, SMA line color), so a bar where both
+// is_bull and is_bear were false would silently render as bearish. Latching
+// keeps the is_bull/is_bear contract strictly binary, exactly like the other
+// two anchors.
+//
+// Only updated on confirmed bars, so the state cannot flip intrabar and then
+// revert — same non-repainting guarantee the other two anchors carry.
+float sma_band = smaBufferATR * atr
+var bool sma_state_bull = true
+
+// Previous bar's latched state, captured BEFORE this bar's update below.
+// sma_state_bull is `var`, so at this point it still holds the value it ended
+// the previous bar with. This is deliberately not `sma_state_bull[1]`: that
+// reads na on bar 0, which would make the flip booleans na rather than false,
+// and nz() has no bool overload to default it with (CE10123).
+var bool sma_prev_bull = true
+sma_prev_bull := sma_state_bull
+
+if barstate.isconfirmed and not na(smaAnchor) and not na(sma_band)
+    if close > smaAnchor + sma_band
+        sma_state_bull := true
+    else if close < smaAnchor - sma_band
+        sma_state_bull := false
+    // inside the band: hold the previous state (hysteresis)
+
+bool sma_is_bull = sma_state_bull
+bool sma_is_bear = not sma_state_bull
+bool sma_flip_up = sma_state_bull and not sma_prev_bull and barstate.isconfirmed
+bool sma_flip_down = not sma_state_bull and sma_prev_bull and barstate.isconfirmed
+
+// Select active anchor based on user input.
+// NOTE: these chains END in the EMA Cross branch, so any anchorMode value other
+// than "SMA" resolves to EMA Cross behavior — it does not error.
+bool is_bull = anchorMode == "SMA" ? sma_is_bull : ema_is_bull
+bool is_bear = anchorMode == "SMA" ? sma_is_bear : ema_is_bear
+bool trendUp = anchorMode == "SMA" ? sma_flip_up : ema_flip_up
+bool trendDown = anchorMode == "SMA" ? sma_flip_down : ema_flip_down
+
+// Price of whichever anchor line is currently plotted. Single source of truth
+// for BUY/SELL label anchoring and the dashboard Trend row.
+float anchor_line_price = anchorMode == "SMA" ? smaAnchor : ema9
+
+// Short label for the active anchor, used in the dashboard Trend row.
+string anchor_short = anchorMode == "SMA" ? "SMA" : "EMA9"
+
+// Is the active anchor warmed up enough to be trusted?
+//
+// Both EMAs produce usable values from the first bars, but
+// ta.sma returns na until smaLenActive bars exist (70-120 depending on
+// profile). sma_state_bull is initialized true and its update block is skipped
+// while smaAnchor is na, so WITHOUT this guard the SMA anchor reports
+// is_bull = true for that entire warm-up window regardless of actual price
+// direction. In the default configuration (Score timing, maxBarsFromFlip = 0)
+// that is enough on its own to fire a BUY on score alone — in a downtrend —
+// seeding the win-rate array with an entry the anchor never endorsed and
+// drawing its label at a na price.
+bool anchor_ready = anchorMode == "SMA" ? not na(smaAnchor) : true
+
+// Track anchor flip as reference point for Trend Extension tracking
+if (trendUp or trendDown)
+    trend_start_price := close
+
+// Bars since the most recent anchor flip — 0 on the flip bar itself,
+// incrementing every bar after. Drives the Score-mode entry freshness gate
+// (maxBarsFromFlip) and the "Bars From Flip" Extended Metrics display.
+var int bars_since_flip = 0
+if trendUp or trendDown
+    bars_since_flip := 0
+else
+    bars_since_flip += 1
+
+
+//======================================================================
+// SCORING ENGINE - 100 POINT SYSTEM
+//======================================================================
+
+// COMPONENT 1: EMA CASCADE ALIGNMENT (profile-adaptive: 20-25 points)
+int t_pts = 0
+string t_status = ""
+
+bool bull_cascade = ema9 > ema20 and ema20 > ema50
+bool bear_cascade = ema9 < ema20 and ema20 < ema50
+
+// Proportional scoring: 100% / 60% / 30% / 0% of ema_max
+int ema_full    = ema_max
+int ema_partial = math.round(ema_max * 0.60)
+int ema_weak    = math.round(ema_max * 0.30)
+
+if is_bull
+    if bull_cascade and close > ema9
+        t_pts := ema_full
+        t_status := "✅ FULL CASCADE"
+    else if close > ema20
+        t_pts := ema_partial
+        t_status := "⚠️ PARTIAL"
+    else if close > ema50
+        t_pts := ema_weak
+        t_status := "⚠️ WEAK"
+    else
+        t_pts := 0
+        t_status := "🔴 COUNTER-TREND"
+else if is_bear
+    if bear_cascade and close < ema9
+        t_pts := ema_full
+        t_status := "✅ FULL CASCADE"
+    else if close < ema20
+        t_pts := ema_partial
+        t_status := "⚠️ PARTIAL"
+    else if close < ema50
+        t_pts := ema_weak
+        t_status := "⚠️ WEAK"
+    else
+        t_pts := 0
+        t_status := "🔴 COUNTER-TREND"
+
+// COMPONENT 2: VWAP VALUE ANCHOR (profile-adaptive: 20-25 points)
+int v_pts = 0
+string v_status = ""
+
+// Proportional scoring: 100% / 72% / 40% / 20% / 0% of vwap_max
+int vwap_full    = vwap_max
+int vwap_healthy = math.round(vwap_max * 0.72)
+int vwap_extended = math.round(vwap_max * 0.40)
+int vwap_grace   = math.round(vwap_max * 0.20)
+
+// Calculate distance from VWAP as percentage (with safety check)
+float vwap_dist_pct = 0.0
+
+// Safety check: Ensure VWAP is valid before calculating
+if not na(vwap) and vwap > 0 and not na(close) and close > 0
+    vwap_dist_pct := math.abs((close - vwap) / vwap) * 100
+    
+    if is_bull
+        // Bullish: Want price ABOVE VWAP
+        if close > vwap and vwap_dist_pct <= (vwap_h_limit * 0.33)
+            v_pts := vwap_full
+            v_status := "✅ BOUNCE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        else if close > vwap and vwap_dist_pct <= vwap_h_limit
+            v_pts := vwap_healthy
+            v_status := "✅ HEALTHY (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        else if close > vwap and vwap_dist_pct <= vwap_e_limit
+            v_pts := vwap_extended
+            v_status := "⚠️ EXTENDED (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        else if close > vwap
+            v_pts := 0
+            v_status := "🔴 REVERSION RISK (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        // Grace zone: bull gets 20% of h_limit tolerance (tighter for short side below)
+        else if close < vwap and vwap_dist_pct <= (vwap_h_limit * 0.2)
+            v_pts := vwap_grace
+            v_status := "⚠️ GRACE ZONE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        else
+            v_pts := 0
+            v_status := "🔴 WRONG SIDE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+            
+    else if is_bear
+        // Bearish: Want price BELOW VWAP
+        if close < vwap and vwap_dist_pct <= (vwap_h_limit * 0.33)
+            v_pts := vwap_full
+            v_status := "✅ REJECTION (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        else if close < vwap and vwap_dist_pct <= vwap_h_limit
+            v_pts := vwap_healthy
+            v_status := "✅ HEALTHY (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        else if close < vwap and vwap_dist_pct <= vwap_e_limit
+            v_pts := vwap_extended
+            v_status := "⚠️ EXTENDED (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        else if close < vwap
+            v_pts := 0
+            v_status := "🔴 REVERSION RISK (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        // Grace zone: bear gets 10% of h_limit tolerance (stricter than bull's 20%)
+        else if close > vwap and vwap_dist_pct <= (vwap_h_limit * 0.1)
+            v_pts := vwap_grace
+            v_status := "⚠️ GRACE ZONE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+        else
+            v_pts := 0
+            v_status := "🔴 WRONG SIDE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+else
+    // VWAP is invalid (na or zero) - handle gracefully
+    v_pts := 0
+    v_status := "⚠️ NO VWAP DATA"
+
+// COMPONENT 3: VOLUME INTENSITY (25 points) - PROFILE-ADAPTIVE
+int vol_pts = 0
+string vol_status = ""
+float rvol_threshold = rvol_gate // Profile-specific minimum
+
+if rel_vol >= 2.5
+    vol_pts := 25
+    vol_status := "💥 EXPLOSIVE"
+else if rel_vol >= 2.0
+    vol_pts := 20
+    vol_status := "🔥 HUGE SPIKE"
+else if rel_vol >= 1.5
+    vol_pts := 15
+    vol_status := "🔥 BIG SPIKE"
+else if rel_vol >= 1.2
+    vol_pts := 10
+    vol_status := "📈 ELEVATED"
+else if rel_vol >= 1.0
+    vol_pts := 5
+    vol_status := "➡️ NORMAL"
+else
+    vol_pts := 0
+    vol_status := "🔴 DEAD"
+
+// LIQUIDITY GATE: If volume below threshold, force score cap
+bool volume_is_dead = rel_vol < rvol_threshold
+
+vol_status += " (" + str.tostring(rel_vol, "#.#") + "x " + rvol_mode_label + ")"
+
+// COMPONENT 4: ADX TREND STRENGTH (15 points) - PROFILE-ADAPTIVE
+bool adx_rising = adx_rising_2  // 2-bar check for stability
+int a_pts = 0
+string a_status = ""
+bool is_choppy = adx < (adx_min * 0.9) // Scales choppy filter
+
+// ADX thresholds scale proportionally with profile-specific adx_min
+// Multipliers: 1.6x (VERY STRONG), 1.3x (STRONG), 1.0x (TRENDING),
+//              0.8x (MODERATE), 0.6x (WEAK), <0.6x (CHOPPY)
+// Example: MARKET profile (adx_min=25) → VERY STRONG = 40
+
+if adx >= (adx_min * 1.6) // Scaled VERY STRONG (approx 35 for standard)
+    if adx_rising
+        a_pts := 15
+        a_status := "🔥 RISING STRONG"
+    else
+        a_pts := 12
+        a_status := "💪 VERY STRONG"
+else if adx >= (adx_min * 1.3) // Scaled STRONG (approx 28 for standard)
+    if adx_rising
+        a_pts := 12
+        a_status := "🔥 RISING "
+    else
+        a_pts := 9
+        a_status := "💪 STRONG"
+else if adx >= adx_min
+    a_pts := 9
+    a_status := "📈 TRENDING"
+else if adx >= (adx_min * 0.8)
+    a_pts := 6
+    a_status := "➡️ MODERATE"
+else if adx >= (adx_min * 0.6)
+    a_pts := 3
+    a_status := "⚠️ WEAK"
+else
+    a_pts := 0
+    a_status := "🔴 CHOPPY"
+
+a_status += " (ADX: " + str.tostring(adx, "#.#") + ")"
+
+// COMPONENT 5: MOMENTUM CONFLUENCE (20 points) - MACD + RSI + SQUEEZE
+// Sub-component A: MACD Directional Alignment (8 points)
+bool macd_aligned = (is_bull and macdLine > 0) or (is_bear and macdLine < 0)
+int macd_pts = macd_aligned ? 8 : 0
+
+// COMPONENT 5B: RSI REGIME-AWARE MOMENTUM (7 points)
+int rsi_pts = 0
+bool rsi_rising = ta.rising(rsiVal, 2)
+bool rsi_breakout = rsiVal > 60 and rsi_rising
+
+if is_bull
+    if rsi_breakout // High-conviction momentum
+        rsi_pts := 7
+    else if rsiVal > 45 and rsiVal <= 60
+        rsi_pts := 5
+    else if rsiVal > 60 and not rsi_rising // Stalling at highs (contiguous with the >60/<=60 tiers above)
+        rsi_pts := 2
+    else
+        rsi_pts := 0
+else if is_bear
+    if rsiVal < 45 and not rsi_rising // High-conviction downside
+        rsi_pts := 7
+    else if rsiVal < 55 and rsiVal >= 40
+        rsi_pts := 5
+    else if rsiVal < 40 and rsi_rising // Stalling at lows (contiguous with the >=40/<40 tiers above)
+        rsi_pts := 2
+    else
+        rsi_pts := 0
+
+// COMPONENT 5C: SQUEEZE RELEASE MOMENTUM (5 points)
+// Moved from Gate 5 to always-active scoring
+// Rewards expansion opportunities regardless of Gate ON/OFF setting
+int sqz_pts = 0
+string sqz_status = ""
+
+if sqz_release and rel_vol > 1.5
+    sqz_pts := 5
+    sqz_status := "💥 BREAKOUT"
+else if sqz_release
+    sqz_pts := 2
+    sqz_status := "⚠️ WEAK BO"
+else
+    sqz_pts := 0
+    sqz_status := "—"
+
+// Combined Momentum Score (now max 20 points)
+int r_pts = macd_pts + rsi_pts + sqz_pts
+string r_status = ""
+
+if r_pts >= 18
+    r_status := "✅ FULL"
+else if r_pts >= 14
+    r_status := "✅ STRONG"
+else if r_pts >= 8
+    r_status := "⚠️ PARTIAL"
+else if r_pts >= 4
+    r_status := "⚠️ WEAK"
+else
+    r_status := "🔴 DIVERGING"
+
+r_status += " (MACD: " + (macd_aligned ? "✓" : "✗") + " | RSI: " + str.tostring(rsiVal, "#.#") + " | SQZ: " + sqz_status + ")"
+
+
+// CALCULATE RAW SCORE (5 components, max 105 points → capped at 100)
+// Component maxes: EMA(20) + VWAP(25) + Volume(25) + ADX(15) + Momentum(20) = 105
+int raw_score = t_pts + v_pts + vol_pts + a_pts + r_pts
+raw_score := math.min(raw_score, 100)
+
+
+//======================================================================
+// RISK GATES - CALCULATE ALL 4 GATES
+//======================================================================
+// Gates 1-4: Applied to final_score (affects signal generation)
+// In ADVISORY MODE: All gates shown but not applied
+// In ENFORCEMENT MODE: All gates applied to final_score
+// NOTE: The old Gate 5 (Breakout Bonus) lives in Component 5C instead
+//======================================================================
+
+//----------------------------------------------------------------------
+// Gate 1: Squeeze (Low Volatility / Range Bound)
+//----------------------------------------------------------------------
+bool gate1_squeeze = is_squeezing
+
+//----------------------------------------------------------------------
+// Gate 2: STRETCH FACTOR
+// Combines EMA mean-reversion risk + trend exhaustion into single metric
+//----------------------------------------------------------------------
+// Calculate trend stretch (move since flip)
+float trend_move = not na(trend_start_price) ? 
+                   math.abs(close - trend_start_price) : 0.0
+// Use intraday ATR for both components so the scales are comparable
+float trend_stretch = atr > 0 ? trend_move / atr : 0.0
+
+// Unified Stretch Factor = MAX(EMA stretch, Trend stretch)
+// Both normalized by intraday ATR(14) — comparable units
+float stretch_factor = math.max(ema_stretch, trend_stretch)
+
+// Tiered stretch assessment (profile-adaptive via ext_scale)
+string stretch_status = ""
+int stretch_penalty = 0
+
+if stretch_factor > (ext_scale * 1.5)
+    stretch_penalty := STRETCH_EXTREME_PENALTY
+    stretch_status := "🎯 EXTREME"
+else if stretch_factor > ext_scale
+    stretch_penalty := STRETCH_MODERATE_PENALTY
+    stretch_status := "⚠️ STRETCHED"
+else
+    stretch_penalty := 0
+    stretch_status := "✅ HEALTHY"
+
+bool gate2_stretched = stretch_penalty > 0
+
+//----------------------------------------------------------------------
+// Gate 3: ATR Fuel Exhaustion (Session Range Maxed)
+//----------------------------------------------------------------------
+bool gate3_fuel = fuel_exhausted and not is_high_velocity
+
+//----------------------------------------------------------------------
+// Gate 4: Liquidity & Strength Circuit Breaker
+//----------------------------------------------------------------------
+bool gate4_liquidity = volume_is_dead and is_choppy
+
+//----------------------------------------------------------------------
+// Calculate penalty values (for display and application)
+//----------------------------------------------------------------------
+int gate1_penalty = gate1_squeeze ? SQUEEZE_PENALTY : 0
+int gate2_penalty = stretch_penalty  // Tiered stretch penalty
+int gate3_penalty = gate3_fuel ? FUEL_PENALTY : 0
+int gate4_penalty = gate4_liquidity ? LIQUIDITY_PENALTY : 0
+
+// Build gate message (always visible regardless of gateOn setting)
+string gate_message = ""
+
+if gate1_squeeze
+    gate_message += "🚧 SQUEEZE (-" + str.tostring(gate1_penalty) + ") "
+
+if gate2_stretched
+    string stretch_detail = str.tostring(stretch_factor, "#.#") + " ATR"
+    gate_message += stretch_status + " (-" + str.tostring(gate2_penalty) + " | " + stretch_detail + ") "
+
+if gate3_fuel
+    gate_message += "🛑 ATRFUEL (-" + str.tostring(gate3_penalty) + ") "
+
+if gate4_liquidity
+    gate_message += "🚫 LIQUIDITY (-" + str.tostring(gate4_penalty) + ") "
+
+
+//======================================================================
+// RISK GATES - APPLY GATES 1-4 TO FINAL SCORE (ENFORCEMENT MODE ONLY)
+//======================================================================
+// Gates 1-4 (pure risk filters)
+//======================================================================
+int final_score = raw_score
+
+if gateOn
+    // ENFORCEMENT MODE: Apply all penalties
+
+    // Gate 1: Squeeze (Low Volatility / Range Bound)
+    if gate1_squeeze
+        final_score := math.max(final_score - gate1_penalty, 0)
+
+    // Gate 2: Stretch Factor (Unified - Mean Reversion + Trend Exhaustion)
+    if gate2_stretched
+        final_score := math.max(final_score - gate2_penalty, 0)
+
+    // Gate 3: Volatility Fuel Exhaustion (Session Range Maxed)
+    if gate3_fuel
+        final_score := math.max(final_score - FUEL_PENALTY, 0)
+
+    // Gate 4: Liquidity & Strength Circuit Breaker
+    if gate4_liquidity
+        final_score := math.max(final_score - gate4_penalty, 0)
+
+// Final Safety Clamp
+final_score := math.max(math.min(final_score, 100), 0)
+
+// Setup quality rating (based on final_score after gates if ON, raw_score if OFF)
+int active_threshold = is_bull ? minScoreBuy : minScoreSell
+
+string stars = final_score >= active_threshold + 30 ? "⭐⭐⭐" : 
+               final_score >= active_threshold + 15 ? "⭐⭐" : 
+               final_score >= active_threshold ? "⭐" : "⚠️"
+
+string setup_quality = final_score >= active_threshold + 30 ? "⭐⭐⭐ EXCELLENT" : 
+                       final_score >= active_threshold + 15 ? "⭐⭐ STRONG" : 
+                       final_score >= active_threshold ? "⭐ GOOD" : "⚠️ WEAK"
+
+//======================================================================
+// SIGNAL QUALITY FILTER
+//======================================================================
+passes_quality_filter(int score, int min_threshold) =>
+    bool result = false
+    
+    if sigQuality == "All Signals"
+        result := score >= 0
+    else if sigQuality == "⭐ +"
+        result := score >= min_threshold
+    else if sigQuality == "⭐⭐ +"
+        result := score >= (min_threshold + 15)
+    else if sigQuality == "⭐⭐⭐ Only"
+        result := score >= (min_threshold + 30)
+    
+    result
+
+//======================================================================
+// SIGNAL P&L HISTORY TRACKING (INDEPENDENT FROM LIVE P&L)
+//======================================================================
+var float last_signal_price = na
+var string last_signal_type = "NONE"
+var bool has_previous_signal = false
+
+//======================================================================
+// RTH SESSION WINDOW
+//======================================================================
+// Defined here (ahead of P&L exit tracking) because the session-open reset
+// must clear stale position state BEFORE current_pnl / PROFIT / LOSS are
+// evaluated on the session-open bar itself.
+bool in_session       = not useSessionFilter or not na(time(timeframe.period, "0930-1600:23456"))
+bool prev_in_session   = not na(time(timeframe.period, "0930-1600:23456")[1])
+bool session_just_opened = useSessionFilter and in_session and not prev_in_session
+
+//======================================================================
+// P&L EXIT TRACKING
+//======================================================================
+// State tracking for PROFIT/LOSS exit signals
+var float pnl_entry_price = na          // Entry price for current position
+var string pnl_direction = "NONE"       // "BUY" or "SELL" or "NONE"
+var bool pnl_exit_fired = false         // Has PROFIT/LOSS fired for this entry?
+var string pnl_exit_type = "NONE"       // Direction of the entry an exit closed
+
+// Flatten at RTH session open. The win-rate tracker already closes any
+// carried-over entry at this boundary (see SIGNAL GENERATION), so leaving
+// pnl_entry_price/pnl_direction live here would let the previous session's
+// entry price fire a spurious PROFIT/LOSS label + alert against the opening
+// gap, and would show the dashboard a position the tracker considers closed.
+if session_just_opened
+    pnl_entry_price := na
+    pnl_direction := "NONE"
+    pnl_exit_fired := false
+    pnl_exit_type := "NONE"
+
+// Calculate current P&L for exit tracking
+float current_pnl = 0.0
+if pnl_direction == "BUY" and not na(pnl_entry_price)
+    current_pnl := ((close - pnl_entry_price) / pnl_entry_price) * 100
+else if pnl_direction == "SELL" and not na(pnl_entry_price)
+    current_pnl := ((pnl_entry_price - close) / pnl_entry_price) * 100
+
+// Target/stop hit detection
+bool target_hit = current_pnl >= pnlTarget
+bool stop_hit = current_pnl <= -pnlTarget
+
+// Target/stop resolution is tracked INTERNALLY regardless of enablePnL, on a
+// confirmed bar, and only once per entry. Win-rate tracking reads these — if
+// they were gated on enablePnL, turning off "Enable P&L Exit Signals" (a
+// display toggle) would silently make every tracked signal score as a loss
+// and pin both win rates at 0%.
+bool target_reached = not pnl_exit_fired and target_hit and barstate.isconfirmed
+bool stop_reached   = not pnl_exit_fired and stop_hit and barstate.isconfirmed
+
+// Visible PROFIT/LOSS exit signals (labels + alerts) — display-gated.
+bool signal_profit = target_reached and enablePnL
+bool signal_loss   = stop_reached and enablePnL
+
+// When the target/stop resolves, mark as fired but DON'T reset position
+// (continue tracking live P&L until the next opposite signal resets entry)
+if target_reached or stop_reached
+    pnl_exit_type := pnl_direction
+    pnl_exit_fired := true
+    // Note: pnl_direction and pnl_entry_price remain unchanged
+    // Live P&L continues until reset conditions below
+
+//======================================================================
+// SUCCESS RATE TRACKING (ROLLING WINDOW)
+// Every BUY/SELL signal is scored when the opposite signal closes it:
+// Win if PROFIT fired at any point during the entry, Loss otherwise
+// (an explicit LOSS exit, or no target hit before the reversal).
+//======================================================================
+// Separate tracking for BUY and SELL signals
+// Uses arrays to track last N signals (configurable via maxSignalsToTrack)
+
+var array<bool> buy_results = array.new<bool>()   // true=Win (hit PROFIT), false=Loss
+var array<bool> sell_results = array.new<bool>()  // true=Win (hit PROFIT), false=Loss
+
+// An entry's outcome isn't known until it closes (the next opposite-direction
+// signal, or an RTH session-open carryover close below), so each entry's
+// "won" flag accumulates PROFIT hits and is read/reset when it closes.
+var bool buy_won_this_entry = false
+var bool sell_won_this_entry = false
+var bool buy_entry_open = false
+var bool sell_entry_open = false
+
+// Helper function to add result to array with max limit
+add_result(array<bool> arr, bool is_win, int max_size) =>
+    array.push(arr, is_win)
+    // Remove oldest if exceeds limit
+    if array.size(arr) > max_size
+        array.shift(arr)
+    arr
+
+// Shared read-only helper — computes [wins, total, rate%] for one
+// results array. Purely reads the array parameter and local variables,
+// so it does not run into the "can't reassign a global" restriction.
+calc_win_rate(array<bool> arr, bool enabled) =>
+    int total = enabled ? array.size(arr) : 0
+    int wins = 0
+    if enabled and total > 0
+        for i = 0 to total - 1
+            if array.get(arr, i)
+                wins += 1
+    float rate = total > 0 ? (wins / total) * 100 : 0.0
+    [wins, total, rate]
+
+[totalWins_buy, totalTrades_buy, success_rate_buy] = calc_win_rate(buy_results, enableSuccessRate)
+[totalWins_sell, totalTrades_sell, success_rate_sell] = calc_win_rate(sell_results, enableSuccessRate)
+
+//======================================================================
+// SIGNAL GENERATION (NON-REPAINTING)
+//======================================================================
+// b_fired/s_fired enforce strict alternation: once a BUY fires, no further
+// BUY can fire — no matter how many bull/bear flips occur — until a SELL
+// actually fires (and vice versa). They only clear on the opposite signal
+// firing or at RTH session open; they do NOT clear on a trend direction
+// change by itself. Live P&L tracking (pnl_entry_price etc.) is unaffected
+// and keeps accumulating across the held direction regardless of this gate.
+var bool b_fired = false
+var bool s_fired = false
+
+// in_session / session_just_opened are defined earlier (RTH SESSION WINDOW),
+// ahead of P&L exit tracking so the same session-open boundary also flattens
+// the carried-over position state.
+//
+// Reset fired flags at session open so first RTH bar fires without overnight carryover.
+// An entry still open from the prior session (never closed by an opposite
+// signal) would otherwise be silently dropped from win-rate tracking once
+// b_fired/s_fired unblock a fresh same-direction signal — score and close
+// it here first, same as a normal opposite-signal close would.
+if session_just_opened
+    b_fired := false
+    s_fired := false
+    if enableSuccessRate
+        if buy_entry_open
+            buy_results := add_result(buy_results, buy_won_this_entry, maxSignalsToTrack)
+            buy_entry_open := false
+            buy_won_this_entry := false
+        if sell_entry_open
+            sell_results := add_result(sell_results, sell_won_this_entry, maxSignalsToTrack)
+            sell_entry_open := false
+            sell_won_this_entry := false
+
+bool signal_buy = false
+bool signal_sell = false
+
+// Entry freshness constraint — Score mode only (Trend mode fires directly
+// off the flip bar, so it's already as fresh as possible by construction and is
+// deliberately left unaffected). maxBarsFromFlip = 0 disables this.
+bool entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip
+
+if sigTime == "Trend"
+    // Fire at anchor flip + quality check. b_fired/s_fired block a same-
+    // direction signal even across multiple flips (e.g. BUY -> flip bear
+    // with no SELL -> flip bull again) until the opposite side actually fires.
+    signal_buy  := in_session and anchor_ready and trendUp and passes_quality_filter(final_score, minScoreBuy) and not b_fired
+    signal_sell := in_session and anchor_ready and trendDown and passes_quality_filter(final_score, minScoreSell) and not s_fired
+
+else  // "Score" mode
+    // Fire when score crosses threshold
+    signal_buy  := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bull and
+                   passes_quality_filter(final_score, minScoreBuy) and
+                   not b_fired
+
+    signal_sell := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bear and
+                   passes_quality_filter(final_score, minScoreSell) and
+                   not s_fired
+
+// Mark as fired to prevent duplicates
+if signal_buy
+    b_fired := true
+    s_fired := false  // Reset opposite to allow next SELL
+if signal_sell
+    s_fired := true
+    b_fired := false  // Reset opposite to allow next BUY
+
+
+//======================================================================
+// CALCULATE SIGNAL P&L (BETWEEN ANY CONSECUTIVE SIGNALS)
+//======================================================================
+// This remains independent - always shows incremental P&L between signals
+float signal_pnl = na
+
+if showSignalPnL and has_previous_signal and not na(last_signal_price)
+    if last_signal_type == "BUY"
+        signal_pnl := ((close - last_signal_price) / last_signal_price) * 100
+    else if last_signal_type == "SELL"
+        signal_pnl := ((last_signal_price - close) / last_signal_price) * 100
+
+//======================================================================
+// UPDATE SUCCESS RATE TRACKING (ROLLING WINDOW)
+//======================================================================
+// add_result() and the buy/sell won/open state are declared earlier
+// (alongside buy_results/sell_results) so the RTH session-open reset can
+// also close out a carried-over entry before this section runs.
+
+// Reads target_reached (not signal_profit) so win-rate stays correct when the
+// PROFIT/LOSS display toggle (enablePnL) is off.
+if enableSuccessRate
+    if target_reached and pnl_direction == "BUY"
+        buy_won_this_entry := true
+    if target_reached and pnl_direction == "SELL"
+        sell_won_this_entry := true
+
+    // The opposite signal closes the prior entry — score it now.
+    if signal_sell and buy_entry_open
+        buy_results := add_result(buy_results, buy_won_this_entry, maxSignalsToTrack)
+    if signal_buy and sell_entry_open
+        sell_results := add_result(sell_results, sell_won_this_entry, maxSignalsToTrack)
+
+    // Open the new entry
+    if signal_buy
+        buy_entry_open := true
+        buy_won_this_entry := false
+    if signal_sell
+        sell_entry_open := true
+        sell_won_this_entry := false
+
+//======================================================================
+// UPDATE SIGNAL P&L TRACKING (INDEPENDENT SYSTEM)
+//======================================================================
+if signal_buy
+    last_signal_price := close
+    last_signal_type := "BUY"
+    has_previous_signal := true
+
+if signal_sell
+    last_signal_price := close
+    last_signal_type := "SELL"
+    has_previous_signal := true
+
+//======================================================================
+// UPDATE P&L EXIT TRACKING
+//======================================================================
+// Pine functions cannot reassign a value-type (float/int/bool/string)
+// global variable, even one declared with `var` — only reference types
+// (array/matrix/map/UDT) can be mutated from inside a function via a
+// parameter. pnl_entry_price/pnl_direction/etc. are plain value types,
+// so the entry/re-arm logic stays inlined at each branch below.
+
+// Reset entry on every new signal. b_fired/s_fired strict alternation
+// (see SIGNAL GENERATION above) means signal_buy can only fire while
+// pnl_direction is "SELL" or "NONE" — never while still "BUY" — except
+// for the rare case where pnl_direction survived an RTH session reset
+// from the prior session's still-open position.
+if signal_buy
+    pnl_entry_price := close
+    pnl_direction := "BUY"
+    pnl_exit_fired := false
+
+if signal_sell
+    pnl_entry_price := close
+    pnl_direction := "SELL"
+    pnl_exit_fired := false
+
+//======================================================================
+// LIVE P&L TRACKING (DASHBOARD DISPLAY)
+//======================================================================
+// Dashboard P&L uses the same entry price as PROFIT/LOSS tracking
+// This ensures consistency between dashboard display and exit signals
+float live_pnl_pct = 0.0
+
+if pnl_direction == "BUY" and not na(pnl_entry_price)
+    live_pnl_pct := ((close - pnl_entry_price) / pnl_entry_price) * 100
+else if pnl_direction == "SELL" and not na(pnl_entry_price)
+    live_pnl_pct := ((pnl_entry_price - close) / pnl_entry_price) * 100
+else
+    live_pnl_pct := 0.0
+
+string pnl_text = pnl_direction != "NONE" ?
+                  str.format("{0,number,+#.##;-#.##}%", live_pnl_pct) :
+                  "—"
+
+//======================================================================
+// DYNAMIC ANCHOR-AWARE VISUAL ELEMENTS
+//======================================================================
+
+//----------------------------------------------------------------------
+// CONDITIONAL DISPLAY: Show active anchor only
+//----------------------------------------------------------------------
+
+// EMA9 Continuous Line (only when EMA Cross mode active)
+// Single line that changes color based on trend direction
+// No gaps - plots on every bar
+color ema9_color = is_bull ? color.green : color.red
+plot(anchorMode == "EMA Cross" ? ema9 : na, "EMA9 Dynamic", 
+     color = ema9_color, style = plot.style_line, linewidth = 3)
+
+// EMA Cross Flip Circles (only in EMA Cross mode)
+plotshape(anchorMode == "EMA Cross" and showCircles and trendUp ? ema9 : na,
+     title = "EMA Cross Up",
+     location = location.absolute,
+     style = shape.circle,
+     size = size.tiny,
+     color = color.green)
+
+plotshape(anchorMode == "EMA Cross" and showCircles and trendDown ? ema9 : na,
+     title = "EMA Cross Down",
+     location = location.absolute,
+     style = shape.circle,
+     size = size.tiny,
+     color = color.red)
+
+// SMA Anchor Line (only when SMA mode active)
+// Colored by the latched state, with the ATR buffer band drawn either side so
+// the neutral zone that suppresses whipsaw flips is visible on the chart.
+color sma_color = is_bull ? color.green : color.red
+plot(anchorMode == "SMA" ? smaAnchor : na, "SMA Anchor",
+     color = sma_color, style = plot.style_line, linewidth = 3)
+
+smaUpper = plot(anchorMode == "SMA" and smaBufferATR > 0 ? smaAnchor + sma_band : na,
+     "SMA Buffer Upper", color = color.new(color.gray, 60), style = plot.style_line, linewidth = 1)
+smaLower = plot(anchorMode == "SMA" and smaBufferATR > 0 ? smaAnchor - sma_band : na,
+     "SMA Buffer Lower", color = color.new(color.gray, 60), style = plot.style_line, linewidth = 1)
+
+fill(smaUpper, smaLower,
+     color = showBg and anchorMode == "SMA" ? color.new(color.gray, 90) : color.new(color.white, 100))
+
+// SMA Flip Circles (only in SMA mode)
+plotshape(anchorMode == "SMA" and showCircles and trendUp ? smaAnchor : na,
+     title = "SMA Bullish Flip",
+     location = location.absolute,
+     style = shape.circle,
+     size = size.tiny,
+     color = color.green)
+
+plotshape(anchorMode == "SMA" and showCircles and trendDown ? smaAnchor : na,
+     title = "SMA Bearish Flip",
+     location = location.absolute,
+     style = shape.circle,
+     size = size.tiny,
+     color = color.red)
+
+//======================================================================
+// BUY/SELL LABELS WITH ANCHOR-AWARE POSITIONING
+//======================================================================
+if signal_buy and showLabels
+    string label_text = "BUY " + stars
+    
+    if showSignalPnL and not na(signal_pnl)
+        label_text += "\n" + str.tostring(signal_pnl, "+#.##;-#.##") + "%"
+    
+    // Anchor-aware label position (see anchor_line_price definition)
+    float label_price = anchor_line_price
+    
+    label.new(bar_index, label_price, label_text,
+         yloc = yloc.price,
+         style = label.style_label_up,
+         color = color.green,
+         textcolor = color.white,
+         size = size.normal)
+
+if signal_sell and showLabels
+    string label_text = "SELL " + stars
+    
+    if showSignalPnL and not na(signal_pnl)
+        label_text += "\n" + str.tostring(signal_pnl, "+#.##;-#.##") + "%"
+    
+    // Anchor-aware label position (see anchor_line_price definition)
+    float label_price = anchor_line_price
+    
+    label.new(bar_index, label_price, label_text,
+         yloc = yloc.price,
+         style = label.style_label_down,
+         color = color.red,
+         textcolor = color.white,
+         size = size.normal)
+
+//======================================================================
+// PROFIT/LOSS EXIT LABELS WITH ANCHOR-AWARE POSITIONING
+//======================================================================
+if signal_profit and enablePnL
+    string label_text = "PROFIT +" + str.tostring(pnlTarget, "#.#") + "%"
+    // Anchor-aware label position (see anchor_line_price definition)
+    float label_price = anchor_line_price
+    string label_style = label.style_label_up
+
+    if signal_buy
+        label_style := label.style_label_down
+    else if signal_sell
+        label_style := label.style_label_up
+    else
+        if pnl_exit_type == "BUY"
+            label_style := label.style_label_up
+        else if pnl_exit_type == "SELL"
+            label_style := label.style_label_down
+
+    label.new(bar_index, label_price, label_text,
+         yloc = yloc.price,
+         style = label_style,
+         color = color.new(color.blue, 0),
+         textcolor = color.white,
+         size = size.normal)
+
+if signal_loss and enablePnL
+    string label_text = "LOSS -" + str.tostring(pnlTarget, "#.#") + "%"
+    // Anchor-aware label position (see anchor_line_price definition)
+    float label_price = anchor_line_price
+    string label_style = label.style_label_down
+
+    if signal_buy
+        label_style := label.style_label_down
+    else if signal_sell
+        label_style := label.style_label_up
+    else
+        if pnl_exit_type == "BUY"
+            label_style := label.style_label_down
+        else if pnl_exit_type == "SELL"
+            label_style := label.style_label_up
+
+    label.new(bar_index, label_price, label_text,
+         yloc = yloc.price,
+         style = label_style,
+         color = color.new(color.blue, 0),
+         textcolor = color.white,
+         size = size.normal)
+
+//======================================================================
+// DASHBOARD
+//======================================================================
+if showDash and barstate.islast
+    // Dashboard score equals final score (no separate dashboard penalties)
+    int dashboard_score = final_score
+
+    // Use trend-appropriate threshold for dashboard display
+    int dashboard_threshold = is_bull ? minScoreBuy : minScoreSell
+
+    string dashboard_quality = dashboard_score >= dashboard_threshold + 30 ? "⭐⭐⭐ EXCELLENT" : 
+                               dashboard_score >= dashboard_threshold + 15 ? "⭐⭐ STRONG" : 
+                               dashboard_score >= dashboard_threshold ? "⭐ GOOD" : "⚠️ WEAK"
+    
+    // Fixed row allocation to prevent overflow
+    
+    // Count active gates
+    int active_gate_count = 0
+    if gate1_squeeze
+        active_gate_count += 1
+    if gate2_stretched
+        active_gate_count += 1
+    if gate3_fuel
+        active_gate_count += 1
+    if gate4_liquidity
+        active_gate_count += 1
+
+    var table d = table.new(position.bottom_right, 2, DASHBOARD_MAX_ROWS,
+         bgcolor = color.new(color.black, 0), border_width = 1)
+
+    // The table is `var`, so cells persist across renders. The gate-details
+    // block is variable-length: when a gate deactivates, its rows would keep
+    // displaying last render's (now false) warning. Wipe every row first.
+    table.clear(d, 0, 0, 1, DASHBOARD_MAX_ROWS - 1)
+
+    // Header
+    string header_with_pnl = "SLT-light " + VERSION + " | PnL " + pnl_text
+    string fixed_header = header_with_pnl + str.substring(DASH_WIDTH, 0, math.max(0, 40 - str.length(header_with_pnl)))
+
+    table.cell(d, 0, 0, fixed_header, 
+        text_color = color.white, 
+        bgcolor = color.new(color.gray, 40),
+        text_size = size.small,
+        text_halign = text.align_center)
+    table.merge_cells(d, 0, 0, 1, 0)
+    
+    int row = 1
+
+    // Trend — reports the ACTIVE anchor (EMA9 or SMA) and its own line price.
+    // anchor_ready is false only while an SMA anchor is still warming up (chart
+    // has fewer bars than smaLenActive). Without this branch the row would read
+    // "BULLISH 🔼 @ NaN" off the latch's initial value and the na SMA price.
+    string trend_state = not anchor_ready ? "WARMING UP ⏳" : is_bull ? "BULLISH 🔼" : "BEARISH 🔽"
+    color trend_color = not anchor_ready ? color.gray : is_bull ? color.lime : color.orange
+    string trend_cell = not anchor_ready ?
+         trend_state + " (" + str.tostring(smaLenActive) + " bars)" :
+         trend_state + " @ " + str.tostring(anchor_line_price, format.mintick)
+    table.cell(d, 0, row, "Trend (" + anchor_short + ")", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(d, 1, row, trend_cell, text_color = trend_color, text_size = size.small)
+    row += 1
+    
+    // Profile Name
+    table.cell(d, 0, row, "Profile", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(d, 1, row, profile_name, text_color = color.white, text_size = size.small)
+    row += 1
+    
+    // Signal Anchor Display with dynamic EMA period
+    string anchor_display = ""
+    if anchorMode == "SMA"
+        anchor_display := "SMA (" + str.tostring(smaLenActive) + ")"
+        anchor_display += smaMode == "AUTO" ? " AUTO" : " MANUAL"
+        anchor_display += " ±" + str.tostring(smaBufferATR, "#.##") + "A"
+    else  // EMA Cross
+        anchor_display := "EMA Cross (9/" + str.tostring(emaSlowPeriod) + ")"
+    
+    table.cell(d, 0, row, "Signal Anchor", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(d, 1, row, anchor_display, text_color = color.gray, text_size = size.small)
+    row += 1
+
+    // Market Regime
+    string m_state = is_squeezing ? "SQUEEZING 🚧" : 
+                     sqz_release ? "BREAKOUT 💥 " + sqz_bias : "📈 TRENDING"
+    table.cell(d, 0, row, "Market State", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(d, 1, row, m_state, text_color = color.white, text_size = size.small)
+    row += 1
+
+    // ATR Fuel
+    string fuel_status = ""
+    
+    // Simplified fuel status (removed early session detection)
+    if fuel_used > fuel_max
+        if is_high_velocity
+            fuel_status := "🔥 VELOCITY OVERRIDE (" + str.tostring(fuel_used, "#") + "%)"
+        else
+            fuel_status := "🔴 EXHAUSTED (" + str.tostring(fuel_used, "#") + "%)"
+    else if fuel_used > 75
+        fuel_status := "⚠️ HIGH (" + str.tostring(fuel_used, "#") + "%)"
+    else if fuel_used > 50
+        fuel_status := "📊 MODERATE (" + str.tostring(fuel_used, "#") + "%)"
+    else if fuel_used > 25
+        fuel_status := "✅ FRESH (" + str.tostring(fuel_used, "#") + "%)"
+    else
+        fuel_status := "💪 FULL FUEL (" + str.tostring(fuel_used, "#") + "%)"
+    
+    table.cell(d, 0, row, "ATR Fuel", 
+         text_color = color.white, 
+         text_halign = text.align_left, 
+         text_size = size.small)
+    table.cell(d, 1, row, fuel_status, 
+         text_color = color.white,
+         text_size = size.small)
+    row += 1
+    
+    // Setup Score
+    table.cell(d, 0, row, "Setup Score", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(d, 1, row, dashboard_quality + " (" + str.tostring(dashboard_score) + ")", text_color = color.white, text_size = size.small)
+    row += 1
+    
+    // Gates Display
+    string gate_label = gateOn ? "Gates" : "Risks"
+    string count_display = active_gate_count > 0 ? str.tostring(active_gate_count) + " ACTIVE" : "NO ACTIVE"
+    color gate_color = active_gate_count > 0 ? color.orange : color.new(color.gray, 40)
+
+    table.cell(d, 0, row, gate_label, text_color = gate_color, text_halign = text.align_left, text_size = size.small)
+    table.cell(d, 1, row, count_display, text_color = gate_color, text_size = size.small)
+    row += 1
+    
+    // SUCCESS RATE DISPLAY (BETWEEN GATES AND EXTENDED METRICS)
+    // Win rate of PROFIT/LOSS target exits, BUY and SELL tracked separately.
+    if enableSuccessRate
+        // Separator before success rates
+        table.cell(d, 0, row, "─────────────────────", text_color = color.new(color.gray, 60), text_size = size.small)
+        table.merge_cells(d, 0, row, 1, row)
+        row += 1
+
+        // BUY Win Rate
+        string buy_count_text = totalTrades_buy >= maxSignalsToTrack ?
+                                 str.tostring(totalWins_buy) + "/" + str.tostring(totalTrades_buy) + " (max)" :
+                                 str.tostring(totalWins_buy) + "/" + str.tostring(totalTrades_buy)
+
+        string buy_rate_display = totalTrades_buy > 0 ?
+                                  str.tostring(success_rate_buy, "#.#") + "% [" + buy_count_text + "]" :
+                                  "— [0/0]"
+
+        color buy_rate_color = success_rate_buy >= 60 ? color.lime :
+                               success_rate_buy >= 50 ? color.yellow : color.red
+
+        table.cell(d, 0, row, "BUY Win Rate",
+             text_color = color.white,
+             text_halign = text.align_left,
+             text_size = size.small)
+        table.cell(d, 1, row, buy_rate_display,
+             text_color = buy_rate_color,
+             text_size = size.small)
+        row += 1
+
+        // SELL Win Rate
+        string sell_count_text = totalTrades_sell >= maxSignalsToTrack ?
+                                 str.tostring(totalWins_sell) + "/" + str.tostring(totalTrades_sell) + " (max)" :
+                                 str.tostring(totalWins_sell) + "/" + str.tostring(totalTrades_sell)
+
+        string sell_rate_display = totalTrades_sell > 0 ?
+                                   str.tostring(success_rate_sell, "#.#") + "% [" + sell_count_text + "]" :
+                                   "— [0/0]"
+
+        color sell_rate_color = success_rate_sell >= 60 ? color.lime :
+                                 success_rate_sell >= 50 ? color.yellow : color.red
+
+        table.cell(d, 0, row, "SELL Win Rate",
+             text_color = color.white,
+             text_halign = text.align_left,
+             text_size = size.small)
+        table.cell(d, 1, row, sell_rate_display,
+             text_color = sell_rate_color,
+             text_size = size.small)
+        row += 1
+
+    // Extended Metrics
+    if extDash
+        // Separator
+        table.cell(d, 0, row, "─────────────────────", text_color = color.new(color.gray, 60), text_size = size.small)
+        table.merge_cells(d, 0, row, 1, row)
+        row += 1
+        
+        // Component Breakdown
+        table.cell(d, 0, row, "EMA Cascade", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, t_status + " (" + str.tostring(t_pts) + ")", text_color = color.white, text_size = size.small)
+        row += 1
+        
+        table.cell(d, 0, row, "VWAP Value", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, v_status + " (" + str.tostring(v_pts) + ")", text_color = color.white, text_size = size.small)
+        row += 1
+        
+        table.cell(d, 0, row, "Volume", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, vol_status + " (" + str.tostring(vol_pts) + ")", text_color = color.white, text_size = size.small)
+        row += 1
+        
+        table.cell(d, 0, row, "ADX Strength", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, a_status + " (" + str.tostring(a_pts) + ")", text_color = color.white, text_size = size.small)
+        row += 1
+        
+        table.cell(d, 0, row, "Momentum", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, r_status + " (" + str.tostring(r_pts) + ")", text_color = color.white, text_size = size.small)
+        row += 1
+
+        // ATR Info
+        string atr_info = "ATR(14): $" + str.tostring(atr_14, "#.##") + 
+                         " | Range: $" + str.tostring(session_range, "#.##")
+        
+        table.cell(d, 0, row, "Volatility", 
+             text_color = color.gray, 
+             text_halign = text.align_left, 
+             text_size = size.small)
+        table.cell(d, 1, row, atr_info,
+             text_color = color.white,
+             text_size = size.small)
+        row += 1
+
+        // Bars From Flip — lets the user calibrate maxBarsFromFlip from observation
+        string bars_flip_display = str.tostring(bars_since_flip) +
+             (maxBarsFromFlip > 0 ? " / " + str.tostring(maxBarsFromFlip) + " max" : " (unlimited)")
+        color bars_flip_color = maxBarsFromFlip > 0 and bars_since_flip > maxBarsFromFlip ? color.gray : color.white
+
+        table.cell(d, 0, row, "Bars From Flip",
+             text_color = color.gray,
+             text_halign = text.align_left,
+             text_size = size.small)
+        table.cell(d, 1, row, bars_flip_display,
+             text_color = bars_flip_color,
+             text_size = size.small)
+        row += 1
+
+        // Gate Details
+        if gate_message != ""
+            array<string> gate_lines = array.new<string>()
+            string current_line = ""
+            string gate_detail_label = gateOn ? "Gate Details" : "Risk Details"
+            
+            array<string> words = str.split(gate_message, " ")
+            
+            for i = 0 to array.size(words) - 1
+                string word = array.get(words, i)
+                string test_line = current_line == "" ? word : current_line + " " + word
+                
+                if str.length(test_line) <= 30
+                    current_line := test_line
+                else
+                    if current_line != ""
+                        array.push(gate_lines, current_line)
+                    current_line := word
+            
+            if current_line != ""
+                array.push(gate_lines, current_line)
+            
+            for i = 0 to array.size(gate_lines) - 1
+                if row >= DASHBOARD_MAX_ROWS
+                    break
+                string line_text = array.get(gate_lines, i)
+
+                if i == 0
+                    table.cell(d, 0, row, gate_detail_label,
+                         text_color = color.orange,
+                         text_halign = text.align_left,
+                         text_size = size.small)
+                    table.cell(d, 1, row, line_text,
+                         text_color = color.orange,
+                         text_size = size.small)
+                else
+                    table.cell(d, 0, row, "",
+                         text_color = color.orange,
+                         text_size = size.small)
+                    table.cell(d, 1, row, line_text,
+                         text_color = color.orange,
+                         text_size = size.small)
+
+                row += 1
+
+//======================================================================
+// ALERTS
+//======================================================================
+alertcondition(signal_buy, title = "BUY", message = "BUY")
+alertcondition(signal_sell, title = "SELL", message = "SELL")
+alertcondition(signal_profit, title = "PROFIT", message = "PROFIT")
+alertcondition(signal_loss, title = "LOSS", message = "LOSS")
