@@ -1122,32 +1122,61 @@ if session_just_opened
             sell_entry_open := false
             sell_won_this_entry := false
 
-bool signal_buy = false
-bool signal_sell = false
-
 // Entry freshness constraint — Score mode only (Trend mode fires directly
 // off the flip bar, so it's already as fresh as possible by construction and is
 // deliberately left unaffected). maxBarsFromFlip = 0 disables this.
 bool entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip
 
+//----------------------------------------------------------------------
+// STRATEGY MODULES  (Phase 1 of the regime-router refactor)
+//----------------------------------------------------------------------
+// Downstream code (P&L, win-rate, labels, alerts, dashboard) fires off
+// signal_buy / signal_sell — the dispatched output of whichever strategy
+// module the router selects. Phase 1 registers exactly ONE module,
+// "Trend Pullback", which is the pre-existing anchor + 5-component
+// confluence + quality-filter logic, condition-for-condition unchanged.
+// The regime string and the router are stubs that always resolve to that
+// one module, so signals are byte-identical to pre-refactor. Phase 2+
+// registers sibling modules (ORB, VWAP fade, …) and gives the router
+// real regime-based selection.
+
+// --- Regime classification (descriptive only in Phase 1; gates nothing) ---
+string regime = is_squeezing ? "SQUEEZE" : sqz_release ? "BREAKOUT" : stretch_factor > ext_scale ? "EXHAUSTED" : adx >= adx_min ? "TREND" : "RANGE"
+
+// --- Module: Trend Pullback ---------------------------------------------
+// Raw directional trigger + quality gate for this module. sigTime
+// ("Trend" / "Score") is a mode of THIS module. anchor_ready, entry_is_fresh
+// and the non-repaint confirm are kept exactly where the pre-refactor
+// signal lines had them: Trend mode leans on trendUp/trendDown already
+// carrying barstate.isconfirmed; Score mode checks it explicitly.
+bool tp_long  = false
+bool tp_short = false
 if sigTime == "Trend"
-    // Fire at anchor flip + quality check. b_fired/s_fired block a same-
-    // direction signal even across multiple flips (e.g. BUY -> flip bear
-    // with no SELL -> flip bull again) until the opposite side actually fires.
-    signal_buy  := in_session and anchor_ready and trendUp and passes_quality_filter(final_score, minScoreBuy) and not b_fired
-    signal_sell := in_session and anchor_ready and trendDown and passes_quality_filter(final_score, minScoreSell) and not s_fired
+    tp_long  := in_session and anchor_ready and trendUp   and passes_quality_filter(final_score, minScoreBuy)
+    tp_short := in_session and anchor_ready and trendDown and passes_quality_filter(final_score, minScoreSell)
+else  // "Score"
+    tp_long  := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bull and
+       passes_quality_filter(final_score, minScoreBuy)
+    tp_short := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bear and
+       passes_quality_filter(final_score, minScoreSell)
+int tp_quality = final_score
 
-else  // "Score" mode
-    // Fire when score crosses threshold
-    signal_buy  := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bull and
-                   passes_quality_filter(final_score, minScoreBuy) and
-                   not b_fired
+// --- Regime router (Phase 1 stub: always Trend Pullback) --------------
+string active_strategy = "Trend Pullback"
+int    strat_quality   = tp_quality
+bool   strat_long      = tp_long
+bool   strat_short     = tp_short
 
-    signal_sell := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bear and
-                   passes_quality_filter(final_score, minScoreSell) and
-                   not s_fired
+//----------------------------------------------------------------------
+// SIGNAL DISPATCH — strict BUY/SELL alternation (NON-REPAINTING)
+//----------------------------------------------------------------------
+// b_fired/s_fired block a same-direction repeat — no matter how many
+// regime/trend flips occur — until the opposite side actually fires.
+// Applies to whatever module the router selected. Cleared here and at
+// RTH session open. Live P&L tracking does not consult these flags.
+bool signal_buy  = strat_long  and not b_fired
+bool signal_sell = strat_short and not s_fired
 
-// Mark as fired to prevent duplicates
 if signal_buy
     b_fired := true
     s_fired := false  // Reset opposite to allow next SELL
@@ -1400,8 +1429,9 @@ if signal_loss and enablePnL
 // DASHBOARD
 //======================================================================
 if showDash and barstate.islast
-    // Dashboard score equals final score (no separate dashboard penalties)
-    int dashboard_score = final_score
+    // Dashboard score = the active strategy's quality (Phase 1: Trend
+    // Pullback, so strat_quality == final_score).
+    int dashboard_score = strat_quality
 
     // Use trend-appropriate threshold for dashboard display
     int dashboard_threshold = is_bull ? minScoreBuy : minScoreSell
@@ -1475,11 +1505,14 @@ if showDash and barstate.islast
     table.cell(d, 1, row, anchor_display, text_color = color.gray, text_size = size.small)
     row += 1
 
-    // Market Regime
-    string m_state = is_squeezing ? "SQUEEZING 🚧" : 
-                     sqz_release ? "BREAKOUT 💥 " + sqz_bias : "📈 TRENDING"
-    table.cell(d, 0, row, "Market State", text_color = color.white, text_halign = text.align_left, text_size = size.small)
-    table.cell(d, 1, row, m_state, text_color = color.white, text_size = size.small)
+    // Strategy + Regime (Phase 1: active_strategy is always "Trend Pullback";
+    // regime is descriptive only and gates nothing yet)
+    string m_state = is_squeezing ? "SQUEEZE 🚧" :
+                     sqz_release ? "BREAKOUT 💥 " + sqz_bias :
+                     regime == "EXHAUSTED" ? "EXHAUSTED 🥵" :
+                     regime == "RANGE" ? "RANGE ↔️" : "📈 TREND"
+    table.cell(d, 0, row, "Strategy", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(d, 1, row, active_strategy + " · " + m_state, text_color = color.white, text_size = size.small)
     row += 1
 
     // ATR Fuel
