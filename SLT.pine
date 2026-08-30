@@ -1008,9 +1008,9 @@ if gateOn
 // Final Safety Clamp
 final_score := math.max(math.min(final_score, 100), 0)
 
-// Setup quality rating (stars / setup_quality) is derived from the ACTIVE
-// strategy's quality, so it is computed after the regime router — see the
-// "Setup quality rating" block below the STRATEGY MODULES section.
+// Setup quality rating (stars) is derived from the ACTIVE strategy's
+// quality, so it is computed after the regime router — see the "Setup
+// quality rating" block below the STRATEGY MODULES section.
 
 //======================================================================
 // SIGNAL QUALITY FILTER
@@ -1412,16 +1412,13 @@ if orb_long or orb_short
     strat_short     := orb_short
 
 // --- Setup quality rating (of the active strategy) ----------------------
-// Reads strat_quality (the active module's 0-100 quality) rather than
-// final_score directly: Trend Pullback -> final_score, ORB -> orb_quality,
-// VWAP Fade -> fade_quality.
+// stars drives the BUY/SELL chart labels. Reads strat_quality (the active
+// module's 0-100 quality) rather than final_score directly: Trend Pullback
+// -> final_score, ORB -> orb_quality, VWAP Fade -> fade_quality.
 int active_threshold = is_bull ? minScoreBuy : minScoreSell
 string stars = strat_quality >= active_threshold + 30 ? "⭐⭐⭐" :
    strat_quality >= active_threshold + 15 ? "⭐⭐" :
    strat_quality >= active_threshold ? "⭐" : "⚠️"
-string setup_quality = strat_quality >= active_threshold + 30 ? "⭐⭐⭐ EXCELLENT" :
-   strat_quality >= active_threshold + 15 ? "⭐⭐ STRONG" :
-   strat_quality >= active_threshold ? "⭐ GOOD" : "⚠️ WEAK"
 
 //----------------------------------------------------------------------
 // SIGNAL DISPATCH — strict BUY/SELL alternation (NON-REPAINTING)
