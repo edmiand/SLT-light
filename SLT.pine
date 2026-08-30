@@ -21,9 +21,11 @@ const int LIQUIDITY_PENALTY = 25
 // DASHBOARD
 const string DASH_WIDTH = "                                        "
 // Sized to leave 6 row slots before the break guard for the
-// variable-length gate-details loop below. Bumped 28 -> 30 in Phase 2 to
-// absorb the optional ORB row (shown only when the ORB module is enabled).
-const int DASHBOARD_MAX_ROWS = 30
+// variable-length gate-details loop below. Bumped 28 -> 30 (Phase 2, optional
+// ORB row) -> 32 (Phase 3, optional VWAP Fade row). Both extra rows render
+// only when their module is enabled, so a user on neither sees the original
+// row count.
+const int DASHBOARD_MAX_ROWS = 32
 
 //======================================================================
 // TYPES
@@ -209,6 +211,28 @@ orbMinQuality = input.int(45, "Min ORB Setup Quality", minval = 0, maxval = 100,
      tooltip = "Minimum orb_quality (0-100: range geometry + breakout volume + VWAP/trend alignment + ATR fuel left) required to fire.")
 orbShowLevels = input.bool(true, "Plot ORB Levels", group = grp_orb,
      tooltip = "Draw the locked opening-range high/low as horizontal lines for the session.")
+
+grp_fade = "🔄 VWAP Fade (Mean Reversion)"
+fadeEnabled = input.bool(false, "Enable VWAP Fade Module", group = grp_fade,
+     tooltip = "COUNTER-TREND module. When price stretches past VWAP ± (fade band x\n" +
+               "ATR-14), stalls, and closes back inside the band on a reversal bar,\n" +
+               "fade the excursion back toward VWAP.\n\n" +
+               "ELIGIBILITY: only in RANGE or EXHAUSTED regime and ADX below 1.5x the\n" +
+               "profile minimum — never fades a live trend or a fresh breakout.\n" +
+               "ROUTER: a fade preempts a same-bar Trend Pullback signal (opposite\n" +
+               "stances), but an ORB breakout preempts the fade.\n\n" +
+               "Default OFF — opt in deliberately. One fade per excursion; the arm\n" +
+               "resets once price reverts through VWAP or a new session opens.")
+fadeBandATR = input.float(2.0, "Fade Band (ATR from VWAP)", minval = 0.5, maxval = 6.0, step = 0.25, group = grp_fade,
+     tooltip = "How far past VWAP (in ATR-14 units) price must trade to arm a fade.")
+fadeMaxRvol = input.float(2.0, "Max RVOL to Fade", minval = 0.0, maxval = 10.0, step = 0.5, group = grp_fade,
+     tooltip = "Skip the fade if relative volume is at or above this on the reversal bar\n" +
+               "(a volume-backed thrust is a breakout, not an exhaustion). 0 disables.")
+fadeMinQuality = input.int(50, "Min Fade Setup Quality", minval = 0, maxval = 100, step = 5, group = grp_fade,
+     tooltip = "Minimum fade_quality (0-100: excursion size + reversal-bar strength +\n" +
+               "volume calm + regime) required to fire.")
+fadeShowBands = input.bool(true, "Plot Fade Bands", group = grp_fade,
+     tooltip = "Draw the VWAP ± fade-band edges as horizontal lines.")
 
 grp_pnl = "💰 P&L Exit Signals"
 enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
@@ -1241,14 +1265,95 @@ bool orb_short = orbEnabled and in_session and barstate.isconfirmed and not orb_
 if orb_long or orb_short
     orb_done := true
 
+// --- Module: VWAP Fade (mean reversion) ---------------------------------
+// Counter-trend. Arm when price trades past VWAP ± fadeBandATR x ATR-14;
+// fire when it closes back inside the band on a reversal bar, targeting a
+// reversion toward VWAP. One fade per excursion — the arm + fired latch
+// reset only when price reverts through VWAP (or a new session opens), so
+// the same excursion cannot fire twice. Eligible only in RANGE / EXHAUSTED
+// regime with ADX < 1.5x the profile minimum: never fades a live trend or a
+// fresh breakout. Non-repainting: state advances on confirmed bars only.
+float fade_band    = fadeBandATR * atr
+float fade_up_edge = not na(vwap) and not na(fade_band) ? vwap + fade_band : na
+float fade_dn_edge = not na(vwap) and not na(fade_band) ? vwap - fade_band : na
+
+var bool  fade_armed_up = false   // price has traded above the upper edge this excursion
+var bool  fade_armed_dn = false
+var float fade_peak_up  = na      // max (high - vwap) during the current up excursion
+var float fade_peak_dn  = na      // max (vwap - low)  during the current down excursion
+var bool  fade_fired_up = false   // a short fade already taken for this up excursion
+var bool  fade_fired_dn = false
+
+if session_just_opened
+    fade_armed_up := false
+    fade_armed_dn := false
+    fade_peak_up := na
+    fade_peak_dn := na
+    fade_fired_up := false
+    fade_fired_dn := false
+
+if barstate.isconfirmed and fadeEnabled and in_session and not na(vwap) and not na(fade_band)
+    // Up excursion: arm + track peak while stretched; deep-reset once price
+    // reverts back through VWAP.
+    if high > fade_up_edge
+        fade_armed_up := true
+        fade_peak_up  := na(fade_peak_up) ? high - vwap : math.max(fade_peak_up, high - vwap)
+    if close < vwap
+        fade_armed_up := false
+        fade_peak_up  := na
+        fade_fired_up := false
+    // Down excursion (mirror)
+    if low < fade_dn_edge
+        fade_armed_dn := true
+        fade_peak_dn  := na(fade_peak_dn) ? vwap - low : math.max(fade_peak_dn, vwap - low)
+    if close > vwap
+        fade_armed_dn := false
+        fade_peak_dn  := na
+        fade_fired_dn := false
+
+bool fade_regime_ok = (regime == "RANGE" or regime == "EXHAUSTED") and adx < adx_min * 1.5
+bool fade_calm      = fadeMaxRvol <= 0 or rel_vol < fadeMaxRvol
+
+// Reversal trigger: was stretched, now closing back inside the band, on a
+// bar that closes against the excursion with momentum rolling over.
+bool fade_short_trig = fade_armed_up and not fade_fired_up and close < fade_up_edge and close < open and rsiVal < rsiVal[1]
+bool fade_long_trig  = fade_armed_dn and not fade_fired_dn and close > fade_dn_edge and close > open and rsiVal > rsiVal[1]
+
+// Setup quality (0-100): excursion size + reversal-bar strength + volume calm + regime
+float fade_excursion_atr = atr > 0 ? (fade_short_trig ? fade_peak_up / atr : (fade_long_trig ? fade_peak_dn / atr : na)) : na
+int fade_q = 0
+if not na(fade_excursion_atr)
+    fade_q := fade_excursion_atr >= 1.5 and fade_excursion_atr <= 4.0 ? 35 : (fade_excursion_atr >= 1.0 and fade_excursion_atr <= 6.0 ? 20 : 8)
+fade_q += (((fade_short_trig and (high - close) > (close - low)) or (fade_long_trig and (close - low) > (high - close))) ? 25 : 10)
+fade_q += (rel_vol < 1.0 ? 20 : (rel_vol < 1.5 ? 10 : 0))
+fade_q += (regime == "EXHAUSTED" ? 20 : (regime == "RANGE" ? 12 : 0))
+int fade_quality = math.min(fade_q, 100)
+
+bool fade_long  = fadeEnabled and in_session and barstate.isconfirmed and fade_regime_ok and fade_calm and
+   fade_long_trig and fade_quality >= fadeMinQuality
+bool fade_short = fadeEnabled and in_session and barstate.isconfirmed and fade_regime_ok and fade_calm and
+   fade_short_trig and fade_quality >= fadeMinQuality
+
+if fade_short
+    fade_fired_up := true
+if fade_long
+    fade_fired_dn := true
+
 // --- Regime router -------------------------------------------------------
-// Priority: an ORB breakout (available only briefly after the open, once per
-// session) preempts a same-bar Trend Pullback signal. Otherwise Trend
-// Pullback owns the bar. Both modules are already fully self-gated.
+// Priority (last write wins): Trend Pullback (default) < VWAP Fade < ORB.
+// Fade sits above Trend Pullback because the two are opposite stances — the
+// fade's regime gate is what keeps both from being eligible in the same
+// backdrop. An ORB breakout (time-boxed, once per session) tops both.
 string active_strategy = "Trend Pullback"
 int    strat_quality   = tp_quality
 bool   strat_long      = tp_long
 bool   strat_short     = tp_short
+
+if fade_long or fade_short
+    active_strategy := "VWAP Fade"
+    strat_quality   := fade_quality
+    strat_long      := fade_long
+    strat_short     := fade_short
 
 if orb_long or orb_short
     active_strategy := "ORB"
@@ -1257,9 +1362,9 @@ if orb_long or orb_short
     strat_short     := orb_short
 
 // --- Setup quality rating (of the active strategy) ----------------------
-// Moved here from the scoring section so it reads strat_quality (the active
-// module's 0-100 quality) rather than final_score directly. For Trend
-// Pullback the two are equal; for ORB, strat_quality is orb_quality.
+// Reads strat_quality (the active module's 0-100 quality) rather than
+// final_score directly: Trend Pullback -> final_score, ORB -> orb_quality,
+// VWAP Fade -> fade_quality.
 int active_threshold = is_bull ? minScoreBuy : minScoreSell
 string stars = strat_quality >= active_threshold + 30 ? "⭐⭐⭐" :
    strat_quality >= active_threshold + 15 ? "⭐⭐" :
@@ -1449,11 +1554,17 @@ plot(orbShowLevels and orb_locked and in_session ? orb_high : na, "ORB High",
 plot(orbShowLevels and orb_locked and in_session ? orb_low : na, "ORB Low",
      color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 1)
 
+// VWAP Fade band edges (teal; only while the fade module is enabled)
+plot(fadeEnabled and in_session and not na(fade_up_edge) ? fade_up_edge : na, "VWAP Fade Upper",
+     color = color.new(color.teal, 40), style = plot.style_linebr, linewidth = 1)
+plot(fadeEnabled and in_session and not na(fade_dn_edge) ? fade_dn_edge : na, "VWAP Fade Lower",
+     color = color.new(color.teal, 40), style = plot.style_linebr, linewidth = 1)
+
 //======================================================================
 // BUY/SELL LABELS WITH ANCHOR-AWARE POSITIONING
 //======================================================================
 if signal_buy and showLabels
-    string label_text = "BUY " + stars + (active_strategy == "ORB" ? " ⚡ORB" : "")
+    string label_text = "BUY " + stars + (active_strategy == "ORB" ? " ⚡ORB" : active_strategy == "VWAP Fade" ? " 🔄FADE" : "")
 
     if showSignalPnL and not na(signal_pnl)
         label_text += "\n" + str.tostring(signal_pnl, "+#.##;-#.##") + "%"
@@ -1469,7 +1580,7 @@ if signal_buy and showLabels
          size = size.normal)
 
 if signal_sell and showLabels
-    string label_text = "SELL " + stars + (active_strategy == "ORB" ? " ⚡ORB" : "")
+    string label_text = "SELL " + stars + (active_strategy == "ORB" ? " ⚡ORB" : active_strategy == "VWAP Fade" ? " 🔄FADE" : "")
 
     if showSignalPnL and not na(signal_pnl)
         label_text += "\n" + str.tostring(signal_pnl, "+#.##;-#.##") + "%"
@@ -1632,6 +1743,17 @@ if showDash and barstate.islast
                           "armed " + str.tostring(orb_high, format.mintick) + " / " + str.tostring(orb_low, format.mintick) + "  Q" + str.tostring(orb_quality)
         table.cell(d, 0, row, "ORB", text_color = color.white, text_halign = text.align_left, text_size = size.small)
         table.cell(d, 1, row, orb_dash, text_color = color.gray, text_size = size.small)
+        row += 1
+
+    // VWAP Fade module status (optional row — only when the module is enabled)
+    if fadeEnabled
+        string fade_dash = na(vwap) ? "no VWAP" :
+                           not fade_regime_ok ? "idle (" + regime + ")" :
+                           fade_armed_up ? "stretched ↑ " + str.tostring(fade_peak_up / atr, "#.#") + " ATR" + (fade_fired_up ? " · done" : "") :
+                           fade_armed_dn ? "stretched ↓ " + str.tostring(fade_peak_dn / atr, "#.#") + " ATR" + (fade_fired_dn ? " · done" : "") :
+                           "watching  ±" + str.tostring(fadeBandATR, "#.#") + " ATR"
+        table.cell(d, 0, row, "VWAP Fade", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, fade_dash, text_color = color.gray, text_size = size.small)
         row += 1
 
     // ATR Fuel
