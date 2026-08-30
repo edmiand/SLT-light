@@ -22,10 +22,11 @@ const int LIQUIDITY_PENALTY = 25
 const string DASH_WIDTH = "                                        "
 // Sized to leave 6 row slots before the break guard for the
 // variable-length gate-details loop below. Bumped 28 -> 30 (Phase 2, optional
-// ORB row) -> 32 (Phase 3, optional VWAP Fade row). Both extra rows render
-// only when their module is enabled, so a user on neither sees the original
-// row count.
-const int DASHBOARD_MAX_ROWS = 32
+// ORB row) -> 32 (Phase 3, optional VWAP Fade row) -> 36 (Phase 4, up to 3
+// optional per-module win-rate rows). Every extra row renders only when the
+// relevant module / tracking is enabled, so a minimal config sees the
+// original row count.
+const int DASHBOARD_MAX_ROWS = 36
 
 //======================================================================
 // TYPES
@@ -34,6 +35,14 @@ const int DASHBOARD_MAX_ROWS = 32
 // so a completed session's per-slot volume history is wrapped in a UDT.
 type TodSession
     array<float> vols
+
+// Per-module win-rate history (Phase 4). Pine arrays can't nest, so each
+// strategy module's BUY / SELL rolling result arrays are wrapped in a UDT
+// and held in a fixed 3-slot array indexed by strat_id() (0 Trend Pullback,
+// 1 ORB, 2 VWAP Fade).
+type ModResults
+    array<bool> buys
+    array<bool> sells
 
 //======================================================================
 // INPUTS
@@ -1108,6 +1117,21 @@ var bool sell_won_this_entry = false
 var bool buy_entry_open = false
 var bool sell_entry_open = false
 
+// Phase 4: per-module win-rate. The overall buy_results/sell_results above
+// stay module-blind; these mirror them split by the module that OPENED the
+// entry. *_entry_strategy is stamped with active_strategy when the entry
+// opens (see UPDATE SUCCESS RATE TRACKING) and read back at every close site.
+var array<ModResults> mod_results = array.new<ModResults>()
+if array.size(mod_results) == 0
+    array.push(mod_results, ModResults.new(array.new<bool>(), array.new<bool>()))  // 0 Trend Pullback
+    array.push(mod_results, ModResults.new(array.new<bool>(), array.new<bool>()))  // 1 ORB
+    array.push(mod_results, ModResults.new(array.new<bool>(), array.new<bool>()))  // 2 VWAP Fade
+
+var string buy_entry_strategy  = "Trend Pullback"
+var string sell_entry_strategy = "Trend Pullback"
+
+strat_id(string s) => s == "ORB" ? 1 : (s == "VWAP Fade" ? 2 : 0)
+
 // Helper function to add result to array with max limit
 add_result(array<bool> arr, bool is_win, int max_size) =>
     array.push(arr, is_win)
@@ -1115,6 +1139,30 @@ add_result(array<bool> arr, bool is_win, int max_size) =>
     if array.size(arr) > max_size
         array.shift(arr)
     arr
+
+// Push one closed-entry result into the per-module store (mutates the UDT's
+// inner array in place — reference type, so no reassignment needed).
+record_module(array<ModResults> store, int id, bool is_buy, bool won, int cap) =>
+    ModResults mr = array.get(store, id)
+    if is_buy
+        array.push(mr.buys, won)
+        if array.size(mr.buys) > cap
+            array.shift(mr.buys)
+    else
+        array.push(mr.sells, won)
+        if array.size(mr.sells) > cap
+            array.shift(mr.sells)
+
+// Compact "<rate>% <wins>/<total>" (or "—") for one results array — used by
+// the per-module dashboard rows. Same win count as calc_win_rate.
+fmt_win_rate(array<bool> arr) =>
+    int t = array.size(arr)
+    int w = 0
+    if t > 0
+        for i = 0 to t - 1
+            if array.get(arr, i)
+                w += 1
+    t > 0 ? str.tostring((w / t) * 100, "#") + "% " + str.tostring(w) + "/" + str.tostring(t) : "—"
 
 // Shared read-only helper — computes [wins, total, rate%] for one
 // results array. Purely reads the array parameter and local variables,
@@ -1159,10 +1207,12 @@ if session_just_opened
     if enableSuccessRate
         if buy_entry_open
             buy_results := add_result(buy_results, buy_won_this_entry, maxSignalsToTrack)
+            record_module(mod_results, strat_id(buy_entry_strategy), true, buy_won_this_entry, maxSignalsToTrack)
             buy_entry_open := false
             buy_won_this_entry := false
         if sell_entry_open
             sell_results := add_result(sell_results, sell_won_this_entry, maxSignalsToTrack)
+            record_module(mod_results, strat_id(sell_entry_strategy), false, sell_won_this_entry, maxSignalsToTrack)
             sell_entry_open := false
             sell_won_this_entry := false
 
@@ -1418,19 +1468,25 @@ if enableSuccessRate
     if target_reached and pnl_direction == "SELL"
         sell_won_this_entry := true
 
-    // The opposite signal closes the prior entry — score it now.
+    // The opposite signal closes the prior entry — score it now, into both
+    // the overall array and the per-module store (keyed by the module that
+    // opened it).
     if signal_sell and buy_entry_open
         buy_results := add_result(buy_results, buy_won_this_entry, maxSignalsToTrack)
+        record_module(mod_results, strat_id(buy_entry_strategy), true, buy_won_this_entry, maxSignalsToTrack)
     if signal_buy and sell_entry_open
         sell_results := add_result(sell_results, sell_won_this_entry, maxSignalsToTrack)
+        record_module(mod_results, strat_id(sell_entry_strategy), false, sell_won_this_entry, maxSignalsToTrack)
 
-    // Open the new entry
+    // Open the new entry — stamp it with the module the router picked this bar.
     if signal_buy
         buy_entry_open := true
         buy_won_this_entry := false
+        buy_entry_strategy := active_strategy
     if signal_sell
         sell_entry_open := true
         sell_won_this_entry := false
+        sell_entry_strategy := active_strategy
 
 //======================================================================
 // UPDATE SIGNAL P&L TRACKING (INDEPENDENT SYSTEM)
@@ -1846,6 +1902,20 @@ if showDash and barstate.islast
              text_color = sell_rate_color,
              text_size = size.small)
         row += 1
+
+        // Per-module win rate (Phase 4). One indented row per module, shown
+        // only for modules that can currently produce signals: Trend Pullback
+        // always, ORB when orbEnabled, VWAP Fade when fadeEnabled. Combined
+        // BUY+SELL, "—" until that module has a resolved signal.
+        for mi = 0 to 2
+            bool mi_show = mi == 0 or (mi == 1 and orbEnabled) or (mi == 2 and fadeEnabled)
+            if mi_show and row < DASHBOARD_MAX_ROWS
+                ModResults mr = array.get(mod_results, mi)
+                string mname = mi == 1 ? "ORB" : mi == 2 ? "VWAP Fade" : "Trend Pull"
+                string mtxt = "B " + fmt_win_rate(mr.buys) + "   S " + fmt_win_rate(mr.sells)
+                table.cell(d, 0, row, "  " + mname, text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+                table.cell(d, 1, row, mtxt, text_color = color.new(color.white, 20), text_size = size.small)
+                row += 1
 
     // Extended Metrics
     if extDash
