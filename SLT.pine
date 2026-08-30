@@ -21,8 +21,9 @@ const int LIQUIDITY_PENALTY = 25
 // DASHBOARD
 const string DASH_WIDTH = "                                        "
 // Sized to leave 6 row slots before the break guard for the
-// variable-length gate-details loop below.
-const int DASHBOARD_MAX_ROWS = 28
+// variable-length gate-details loop below. Bumped 28 -> 30 in Phase 2 to
+// absorb the optional ORB row (shown only when the ORB module is enabled).
+const int DASHBOARD_MAX_ROWS = 30
 
 //======================================================================
 // TYPES
@@ -182,6 +183,32 @@ rvolMode = input.string("Time-of-Day", "Relative Volume Mode",
 rvolLookbackDays = input.int(10, "RVOL Lookback Sessions", minval = 3, maxval = 20, group = grp_sig,
      tooltip = "Number of prior sessions averaged per intraday bar-slot for\n" +
                "Time-of-Day RVOL mode. Only used when Relative Volume Mode = Time-of-Day.")
+
+grp_orb = "🔔 Opening Range Breakout"
+orbEnabled = input.bool(true, "Enable ORB Module", group = grp_orb,
+     tooltip = "Adds an Opening Range Breakout strategy alongside Trend Pullback.\n\n" +
+               "RANGE: high/low of the first N minutes of the RTH session.\n" +
+               "ENTRY: the first confirmed close that clears a range edge (by the\n" +
+               "        breakout buffer) — one breakout per session.\n" +
+               "ROUTER: during its window an ORB breakout preempts a same-bar\n" +
+               "        Trend Pullback signal.\n\n" +
+               "REQUIRES the RTH Session Filter ON — the range is anchored to the\n" +
+               "session open. With the filter OFF the range never locks and the\n" +
+               "module stays inert.")
+orbMinutes = input.int(30, "Opening Range (minutes)", minval = 5, maxval = 120, step = 5, group = grp_orb,
+     tooltip = "Length of the opening range, measured from the RTH open.")
+orbEntryCutoffMin = input.int(120, "Entry Cutoff (minutes from open)", minval = 15, maxval = 390, step = 15, group = grp_orb,
+     tooltip = "No ORB entry after this many minutes past the open (still at most one per session).")
+orbBufferATR = input.float(0.05, "Breakout Buffer (ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = grp_orb,
+     tooltip = "Price must clear the range edge by this many ATR(14) before the break counts. 0 = touch triggers.")
+orbMinRvol = input.float(1.2, "Min RVOL on Breakout", minval = 0.0, maxval = 5.0, step = 0.1, group = grp_orb,
+     tooltip = "Require relative volume at least this on the breakout bar. 0 disables the check.")
+orbRequireVwapSide = input.bool(true, "Require VWAP Alignment", group = grp_orb,
+     tooltip = "Long breakouts only when close > VWAP; short breakouts only when close < VWAP.")
+orbMinQuality = input.int(45, "Min ORB Setup Quality", minval = 0, maxval = 100, step = 5, group = grp_orb,
+     tooltip = "Minimum orb_quality (0-100: range geometry + breakout volume + VWAP/trend alignment + ATR fuel left) required to fire.")
+orbShowLevels = input.bool(true, "Plot ORB Levels", group = grp_orb,
+     tooltip = "Draw the locked opening-range high/low as horizontal lines for the session.")
 
 grp_pnl = "💰 P&L Exit Signals"
 enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
@@ -948,16 +975,9 @@ if gateOn
 // Final Safety Clamp
 final_score := math.max(math.min(final_score, 100), 0)
 
-// Setup quality rating (based on final_score after gates if ON, raw_score if OFF)
-int active_threshold = is_bull ? minScoreBuy : minScoreSell
-
-string stars = final_score >= active_threshold + 30 ? "⭐⭐⭐" : 
-               final_score >= active_threshold + 15 ? "⭐⭐" : 
-               final_score >= active_threshold ? "⭐" : "⚠️"
-
-string setup_quality = final_score >= active_threshold + 30 ? "⭐⭐⭐ EXCELLENT" : 
-                       final_score >= active_threshold + 15 ? "⭐⭐ STRONG" : 
-                       final_score >= active_threshold ? "⭐ GOOD" : "⚠️ WEAK"
+// Setup quality rating (stars / setup_quality) is derived from the ACTIVE
+// strategy's quality, so it is computed after the regime router — see the
+// "Setup quality rating" block below the STRATEGY MODULES section.
 
 //======================================================================
 // SIGNAL QUALITY FILTER
@@ -1128,22 +1148,19 @@ if session_just_opened
 bool entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip
 
 //----------------------------------------------------------------------
-// STRATEGY MODULES  (Phase 1 of the regime-router refactor)
+// STRATEGY MODULES  (regime-router refactor — Phase 2: Trend Pullback + ORB)
 //----------------------------------------------------------------------
 // Downstream code (P&L, win-rate, labels, alerts, dashboard) fires off
 // signal_buy / signal_sell — the dispatched output of whichever strategy
-// module the router selects. Phase 1 registers exactly ONE module,
-// "Trend Pullback", which is the pre-existing anchor + 5-component
-// confluence + quality-filter logic, condition-for-condition unchanged.
-// The regime string and the router are stubs that always resolve to that
-// one module, so signals are byte-identical to pre-refactor. Phase 2+
-// registers sibling modules (ORB, VWAP fade, …) and gives the router
-// real regime-based selection.
+// module the router selects. Each module is fully self-gated and exposes
+// <name>_long / <name>_short / <name>_quality; the router only CHOOSES
+// between modules, it never loosens a module's own rules. The signal
+// dispatch layer below then applies session/warm-up/alternation uniformly.
 
-// --- Regime classification (descriptive only in Phase 1; gates nothing) ---
+// --- Regime classification (descriptive; informs the dashboard, not a gate) ---
 string regime = is_squeezing ? "SQUEEZE" : sqz_release ? "BREAKOUT" : stretch_factor > ext_scale ? "EXHAUSTED" : adx >= adx_min ? "TREND" : "RANGE"
 
-// --- Module: Trend Pullback ---------------------------------------------
+// --- Module: Trend Pullback -------------------------------------------------
 // Raw directional trigger + quality gate for this module. sigTime
 // ("Trend" / "Score") is a mode of THIS module. anchor_ready, entry_is_fresh
 // and the non-repaint confirm are kept exactly where the pre-refactor
@@ -1161,11 +1178,95 @@ else  // "Score"
        passes_quality_filter(final_score, minScoreSell)
 int tp_quality = final_score
 
-// --- Regime router (Phase 1 stub: always Trend Pullback) --------------
+// --- Module: Opening Range Breakout ---------------------------------------
+// Range = high/low of the first orbMinutes of the RTH session, latched once
+// the window closes. Then the first confirmed close that clears a range edge
+// (by orbBufferATR x ATR-14), within orbEntryCutoffMin of the open, with
+// enough volume / VWAP alignment / setup quality, fires ONE breakout per
+// session. Anchored to session_just_opened, so it needs useSessionFilter ON;
+// with the filter off orb_open_time stays na, the range never locks, and the
+// module is inert. Non-repainting: the range only latches on a confirmed bar
+// and every breakout term requires barstate.isconfirmed.
+var int   orb_open_time = na    // epoch ms of the RTH open bar (session anchor)
+var float orb_high      = na
+var float orb_low       = na
+var bool  orb_locked    = false
+var bool  orb_done      = false // breakout already taken this session
+
+if session_just_opened
+    orb_open_time := time
+    orb_high := high
+    orb_low  := low
+    orb_locked := false
+    orb_done := false
+
+float orb_mins = not na(orb_open_time) ? (time - orb_open_time) / 60000.0 : na
+
+// Extend the range through the first orbMinutes, then latch it (confirmed bars
+// only — matches the non-repaint guarantee the anchors carry).
+if barstate.isconfirmed and orbEnabled and in_session and not na(orb_mins) and not orb_locked
+    if orb_mins < orbMinutes
+        orb_high := math.max(orb_high, high)
+        orb_low  := math.min(orb_low, low)
+    else
+        orb_locked := true
+
+// Breakout evaluation
+float orb_buf = orbBufferATR * atr
+bool orb_long_setup  = orb_locked and not na(orb_high) and close > orb_high + orb_buf
+bool orb_short_setup = orb_locked and not na(orb_low)  and close < orb_low  - orb_buf
+int  orb_dir = orb_long_setup ? 1 : orb_short_setup ? -1 : 0
+
+// Setup quality (0-100): range geometry + breakout volume + alignment + fuel
+float orb_range_atr = orb_locked and not na(orb_high) and not na(orb_low) and atr > 0 ? (orb_high - orb_low) / atr : na
+int orb_q = 0
+if not na(orb_range_atr)
+    orb_q := orb_range_atr >= 0.75 and orb_range_atr <= 2.0 ? 30 : (orb_range_atr >= 0.5 and orb_range_atr <= 3.0 ? 18 : 8)
+orb_q += (rel_vol >= 2.0 ? 30 : (rel_vol >= 1.5 ? 22 : (rel_vol >= 1.2 ? 14 : (rel_vol >= 1.0 ? 6 : 0))))
+orb_q += (((orb_dir == 1 and not na(vwap) and close > vwap) or (orb_dir == -1 and not na(vwap) and close < vwap)) ? 12 : 0)
+orb_q += (((orb_dir == 1 and is_bull) or (orb_dir == -1 and is_bear)) ? 8 : 0)
+orb_q += (fuel_used < 50 ? 20 : (fuel_used < 75 ? 12 : (fuel_used < fuel_max ? 5 : 0)))
+int orb_quality = math.min(orb_q, 100)
+
+bool orb_vol_ok        = orbMinRvol <= 0 or rel_vol >= orbMinRvol
+bool orb_vwap_long_ok  = not orbRequireVwapSide or (not na(vwap) and close > vwap)
+bool orb_vwap_short_ok = not orbRequireVwapSide or (not na(vwap) and close < vwap)
+bool orb_cutoff_ok     = orbEntryCutoffMin <= 0 or (not na(orb_mins) and orb_mins <= orbEntryCutoffMin)
+
+bool orb_long  = orbEnabled and in_session and barstate.isconfirmed and not orb_done and orb_cutoff_ok and
+   orb_long_setup and orb_vol_ok and orb_vwap_long_ok and orb_quality >= orbMinQuality
+bool orb_short = orbEnabled and in_session and barstate.isconfirmed and not orb_done and orb_cutoff_ok and
+   orb_short_setup and orb_vol_ok and orb_vwap_short_ok and orb_quality >= orbMinQuality
+
+if orb_long or orb_short
+    orb_done := true
+
+// --- Regime router -------------------------------------------------------
+// Priority: an ORB breakout (available only briefly after the open, once per
+// session) preempts a same-bar Trend Pullback signal. Otherwise Trend
+// Pullback owns the bar. Both modules are already fully self-gated.
 string active_strategy = "Trend Pullback"
 int    strat_quality   = tp_quality
 bool   strat_long      = tp_long
 bool   strat_short     = tp_short
+
+if orb_long or orb_short
+    active_strategy := "ORB"
+    strat_quality   := orb_quality
+    strat_long      := orb_long
+    strat_short     := orb_short
+
+// --- Setup quality rating (of the active strategy) ----------------------
+// Moved here from the scoring section so it reads strat_quality (the active
+// module's 0-100 quality) rather than final_score directly. For Trend
+// Pullback the two are equal; for ORB, strat_quality is orb_quality.
+int active_threshold = is_bull ? minScoreBuy : minScoreSell
+string stars = strat_quality >= active_threshold + 30 ? "⭐⭐⭐" :
+   strat_quality >= active_threshold + 15 ? "⭐⭐" :
+   strat_quality >= active_threshold ? "⭐" : "⚠️"
+string setup_quality = strat_quality >= active_threshold + 30 ? "⭐⭐⭐ EXCELLENT" :
+   strat_quality >= active_threshold + 15 ? "⭐⭐ STRONG" :
+   strat_quality >= active_threshold ? "⭐ GOOD" : "⚠️ WEAK"
 
 //----------------------------------------------------------------------
 // SIGNAL DISPATCH — strict BUY/SELL alternation (NON-REPAINTING)
@@ -1341,12 +1442,19 @@ plotshape(anchorMode == "SMA" and showCircles and trendDown ? smaAnchor : na,
      size = size.tiny,
      color = color.red)
 
+// Opening Range levels (locked high/low for the current session; break
+// between sessions via style_linebr so lines don't connect across the gap)
+plot(orbShowLevels and orb_locked and in_session ? orb_high : na, "ORB High",
+     color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 1)
+plot(orbShowLevels and orb_locked and in_session ? orb_low : na, "ORB Low",
+     color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 1)
+
 //======================================================================
 // BUY/SELL LABELS WITH ANCHOR-AWARE POSITIONING
 //======================================================================
 if signal_buy and showLabels
-    string label_text = "BUY " + stars
-    
+    string label_text = "BUY " + stars + (active_strategy == "ORB" ? " ⚡ORB" : "")
+
     if showSignalPnL and not na(signal_pnl)
         label_text += "\n" + str.tostring(signal_pnl, "+#.##;-#.##") + "%"
     
@@ -1361,8 +1469,8 @@ if signal_buy and showLabels
          size = size.normal)
 
 if signal_sell and showLabels
-    string label_text = "SELL " + stars
-    
+    string label_text = "SELL " + stars + (active_strategy == "ORB" ? " ⚡ORB" : "")
+
     if showSignalPnL and not na(signal_pnl)
         label_text += "\n" + str.tostring(signal_pnl, "+#.##;-#.##") + "%"
     
@@ -1505,8 +1613,8 @@ if showDash and barstate.islast
     table.cell(d, 1, row, anchor_display, text_color = color.gray, text_size = size.small)
     row += 1
 
-    // Strategy + Regime (Phase 1: active_strategy is always "Trend Pullback";
-    // regime is descriptive only and gates nothing yet)
+    // Strategy + Regime (active_strategy is the router's pick this bar;
+    // regime is descriptive only and gates nothing)
     string m_state = is_squeezing ? "SQUEEZE 🚧" :
                      sqz_release ? "BREAKOUT 💥 " + sqz_bias :
                      regime == "EXHAUSTED" ? "EXHAUSTED 🥵" :
@@ -1514,6 +1622,17 @@ if showDash and barstate.islast
     table.cell(d, 0, row, "Strategy", text_color = color.white, text_halign = text.align_left, text_size = size.small)
     table.cell(d, 1, row, active_strategy + " · " + m_state, text_color = color.white, text_size = size.small)
     row += 1
+
+    // ORB module status (optional row — only when the module is enabled)
+    if orbEnabled
+        string orb_dash = not useSessionFilter ? "⚠️ needs RTH filter" :
+                          na(orb_open_time) ? "waiting for open" :
+                          not orb_locked ? "forming " + str.tostring(orb_high, format.mintick) + " / " + str.tostring(orb_low, format.mintick) :
+                          orb_done ? "✅ fired this session" :
+                          "armed " + str.tostring(orb_high, format.mintick) + " / " + str.tostring(orb_low, format.mintick) + "  Q" + str.tostring(orb_quality)
+        table.cell(d, 0, row, "ORB", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, orb_dash, text_color = color.gray, text_size = size.small)
+        row += 1
 
     // ATR Fuel
     string fuel_status = ""
