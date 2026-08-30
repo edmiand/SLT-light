@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Pine Script v6 TradingView indicator** — a single-file intraday momentum trading system, **forked from SuperLazyTrade with the SuperTrend signal anchor removed**. The sole source file is `SLT-light.pine`. There is no build system, package manager, or test runner; development means editing the `.pine` file and pasting it into TradingView's Pine Editor to compile and validate.
+This is a **Pine Script v6 TradingView indicator** — a single-file intraday momentum trading system, **forked from SuperLazyTrade with the SuperTrend signal anchor removed**. The sole source file is `SLT.pine`. There is no build system, package manager, or test runner; development means editing the `.pine` file and pasting it into TradingView's Pine Editor to compile and validate.
 
-SLT-light keeps two signal anchors: **EMA Cross** (default) and **SMA**. Everything else — the 5-component scoring engine, the 4 risk gates, both P&L tracking systems, win-rate tracking, and the dashboard — is unchanged from the parent project.
+SLT keeps two signal anchors: **SMA** (default) and **EMA Cross**. Everything else — the 5-component scoring engine, the 4 risk gates, both P&L tracking systems, win-rate tracking, and the dashboard — is unchanged from the parent project.
 
 ## Development Workflow
 
-1. Edit `SLT-light.pine`
+1. Edit `SLT.pine`
 2. Copy the full file contents
 3. Open TradingView → Pine Editor → paste → Save → Add to Chart
 4. Compilation errors appear immediately in the Pine Editor console
@@ -114,7 +114,7 @@ All 5 components sum to `raw_score`, capped at 100. Component maxes vary by prof
 
 ## SMA Anchor
 
-Second `anchorMode` option (the other is EMA Cross, the default). Selected when `anchorMode = "SMA"`.
+The default `anchorMode` option (the other is EMA Cross). Selected when `anchorMode = "SMA"`.
 
 **Length** (`sma_len`) is assigned per asset profile in the profile block — see the `sma_len` column in the [Profile Parameters Table](#profile-parameters-table) — and resolved to `smaLenActive` by `smaMode`:
 
@@ -225,7 +225,7 @@ No test runner exists. After any edit, verify manually in this order:
 4. **Signal alternation:** let a BUY fire → confirm next BUY is blocked until a SELL fires, including across multiple trend flips where SELL's quality filter never clears (BUY → flip bear, no SELL → flip bull again → still no second BUY)
 5. **No double-count on same-bar PROFIT + new signal:** when a PROFIT fires on the same bar as a new signal, confirm success rate increments by 1, not 2
 6. **Gate enforcement:** toggle `Enable Risk Gates` ON → confirm score drops when gates are active; toggle OFF → score unchanged but warnings visible
-7. **EMA Cross mode:** anchor defaults to EMA Cross → confirm EMA9 line appears (not the SMA line), flip circles appear at crossover bars
+7. **SMA mode:** anchor defaults to SMA → confirm the SMA line appears (not EMA9) with its grey ATR buffer band, flip circles appear where the latched state changes; switch to EMA Cross → confirm EMA9 line appears instead, flip circles at crossover bars
 8. **Dashboard row count:** with Success Rate Tracking + all 4 gates active + Extended Metrics ON, confirm no runtime error (row overflow guard working; `DASHBOARD_MAX_ROWS = 28`)
 9. **RVOL mode:** toggle `Relative Volume Mode` between `Rolling 20-bar` and `Time-of-Day` on the same chart → confirm the Volume row's RVOL multiplier and mode label (`TOD` / `20-bar`) both change, and that a chart with less than `RVOL Lookback Sessions` of history shows `20-bar*` (fallback) instead of `na` or a stale value
 10. **P&L Target:** with `Enable P&L Exit Signals` on, confirm PROFIT/LOSS fires at exactly `±P&L Target (%)` from `pnl_entry_price` and labels show the static target text (e.g. `PROFIT +1.0%`)
@@ -241,4 +241,4 @@ No test runner exists. After any edit, verify manually in this order:
 
 ## Version
 
-The script file is `SLT-light.pine`. It was forked from **SuperLazyTrade V3** with the SuperTrend signal anchor removed entirely: the input option, the SuperTrend Engine settings group (`atrMode` / `atrLen_manual` / `factor_manual`), the adaptive ATR/factor selection block, the `ta.supertrend` call, the `st_*` anchor, its plots/fills/flip circles, and the dashboard branch. Anchor selection is now binary — EMA Cross (default) or SMA. The on-chart `indicator()` title is `SLT-light V3` (from `VERSION = "V3"`). No changelog history is tracked in the file — treat the current source as the reference behavior going forward.
+The script file is `SLT.pine`. It was forked from **SuperLazyTrade V3** with the SuperTrend signal anchor removed entirely: the input option, the SuperTrend Engine settings group (`atrMode` / `atrLen_manual` / `factor_manual`), the adaptive ATR/factor selection block, the `ta.supertrend` call, the `st_*` anchor, its plots/fills/flip circles, and the dashboard branch. Anchor selection is now binary — SMA (default) or EMA Cross. The on-chart `indicator()` title is `SLT V1` (from `VERSION = "V1"`). No changelog history is tracked in the file — treat the current source as the reference behavior going forward.

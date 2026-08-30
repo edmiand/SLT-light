@@ -1,8 +1,8 @@
 //@version=6
 
 // Version
-string VERSION = "V3"
-indicator("SLT-light " + VERSION, overlay = true, max_labels_count = 300)
+string VERSION = "V1"
+indicator("SLT " + VERSION, overlay = true, max_labels_count = 300)
 
 // By: @dmandrey
 //
@@ -41,7 +41,7 @@ type TodSession
 // SIGNAL ANCHOR SELECTION
 //======================================================================
 grp_anchor = "📍 Signal Anchor"
-anchorMode = input.string("EMA Cross", "Signal Anchor",
+anchorMode = input.string("SMA", "Signal Anchor",
      options = ["EMA Cross", "SMA"],
      group = grp_anchor,
      tooltip = "EMA CROSS:\n" +
@@ -236,7 +236,7 @@ maxSignalsToTrack = input.int(50, "Max Signals to Track", minval = 10, maxval = 
 
 grp_vis = "Dashboard & Visuals"
 showDash = input.bool(true, "Show Dashboard", group = grp_vis)
-extDash  = input.bool(true, "Extended Metrics", group = grp_vis,
+extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
      tooltip = "Show detailed point breakdown for each component")
 showCircles = input.bool(true, "Show Trend Flip Circles", group = grp_vis)
 showBg   = input.bool(true, "Show Trend Background", group = grp_vis)
@@ -1432,7 +1432,7 @@ if showDash and barstate.islast
     table.clear(d, 0, 0, 1, DASHBOARD_MAX_ROWS - 1)
 
     // Header
-    string header_with_pnl = "SLT-light " + VERSION + " | PnL " + pnl_text
+    string header_with_pnl = "SLT " + VERSION + " | PnL " + pnl_text
     string fixed_header = header_with_pnl + str.substring(DASH_WIDTH, 0, math.max(0, 40 - str.length(header_with_pnl)))
 
     table.cell(d, 0, 0, fixed_header, 
