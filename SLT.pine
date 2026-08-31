@@ -45,261 +45,76 @@ type ModResults
     array<bool> sells
 
 //======================================================================
-// INPUTS
+// INPUTS  —  SLT-light: three user controls
+//   1. Signal Anchor  (EMA Cross / SMA)
+//   2. Score Stars    (label selectivity)
+//   3. P&L Exit        (on/off + target %)
+// Everything else is auto-tuned from the asset profile (see the profile
+// block below) and the anchor choice. To hand-tune, edit the profile
+// table — not the settings panel.
 //======================================================================
 
-
-//======================================================================
-// SIGNAL ANCHOR SELECTION
-//======================================================================
 grp_anchor = "📍 Signal Anchor"
 anchorMode = input.string("SMA", "Signal Anchor",
      options = ["EMA Cross", "SMA"],
      group = grp_anchor,
      tooltip = "EMA CROSS:\n" +
-               "• Signals on EMA9 crossing slow EMA\n" +
-               "• Faster entries, catches early momentum\n" +
-               "• More responsive to price action\n" +
+               "• Signals on EMA9 crossing the slow EMA\n" +
+               "• Faster, earlier entries — more signals\n" +
                "• Best for: NVDA, TSLA (fast movers), aggressive trading\n\n" +
                "SMA:\n" +
                "• Signals on price crossing a slow structural SMA\n" +
-               "• Slowest anchor — filters out intraday noise entirely\n" +
-               "• ATR buffer band + latched state kills whipsaw\n" +
-               "• Best for: choppy instruments, fewer/higher-conviction entries\n\n" +
-               "NOTE: Both use the same scoring/gates for quality filtering")
+               "• Slowest anchor — ATR buffer band + latched state kills whipsaw\n" +
+               "• Best for: choppy instruments, fewer / higher-conviction entries\n\n" +
+               "Slow-EMA period, SMA length, SMA buffer, min score, RTH filter and\n" +
+               "entry-freshness are all set automatically from the asset profile\n" +
+               "and this choice. Both anchors share the same scoring / gates.")
 
-// EMA Period Selection (only applies to EMA Cross mode)
-emaSlowPeriod = input.int(30, "EMA Slow Period",
-     options = [20, 30],
-     group = grp_anchor,
-     tooltip = "Select slow EMA period for EMA Cross mode:\n\n" +
-               "EMA 9/20 (Faster):\n" +
-               "• Very responsive, more signals (5-10/session)\n" +
-               "• Catches early momentum and breakouts\n" +
-               "• Higher whipsaw risk in choppy markets\n" +
-               "• Best for: NVDA, TSLA (fast movers)\n" +
-               "• Observed: SOXX 74% BUY / 54% SELL\n\n" +
-               "EMA 9/30 (Default — Smoother):\n" +
-               "• More selective, fewer signals (3-7/session)\n" +
-               "• Better trend filtering, rides moves longer\n" +
-               "• Lower whipsaw risk (-40% reduction)\n" +
-               "• Best for: SOXX, Silver, SPY/QQQ\n" +
-               "• Expected: Better SELL win rates (+5-10%)\n\n" +
-               "NOTE: Only applies when 'Signal Anchor' = EMA Cross")
-
-
-//======================================================================
-// SMA ANCHOR SETTINGS (only used when Signal Anchor = SMA)
-//======================================================================
-grp_sma = "📉 SMA Anchor"
-smaMode = input.string("AUTO", "SMA Length Mode",
-     options = ["AUTO", "MANUAL"],
-     group = grp_sma,
-     tooltip = "AUTO: SMA length set per asset profile\n" +
-               "• STOCK: 70\n" +
-               "• ETF / FUND: 90\n" +
-               "• FUTURES: 70\n" +
-               "• CRYPTO: 120\n" +
-               "• MARKET INDEX: 90\n\n" +
-               "MANUAL: use the Manual SMA Length below")
-
-smaLen_manual = input.int(70, "Manual SMA Length", minval = 10, maxval = 300, group = grp_sma,
-     tooltip = "Only used when SMA Length Mode = MANUAL\n" +
-               "70 on a 2-min chart ≈ 2.3 hours of price")
-
-smaBufferATR = input.float(0.25, "SMA Buffer (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05,
-     group = grp_sma,
-     tooltip = "Neutral band around the SMA, measured in ATR(14).\n\n" +
-               "Bull latches only when close > SMA + buffer.\n" +
-               "Bear latches only when close < SMA - buffer.\n" +
-               "Inside the band the previous state is held (hysteresis).\n\n" +
-               "0.0 = raw price/SMA cross (noisy — many flips per session)\n" +
-               "0.25 = default, filters most chop\n" +
-               "0.50+ = very few flips, later entries")
-
-//======================================================================
-// SIGNAL SETTINGS
-//======================================================================
-grp_sig = "Signal & Risk Management"
-showLabels = input.bool(true, "Show BUY/SELL Labels", group = grp_sig,
-     tooltip = "Display BUY/SELL labels on chart when signals fire")
-sigTime = input.string("Score", "Signal Timing", options = ["Trend", "Score"], group = grp_sig,
-     tooltip = "Trend: Fire at every anchor flip\nScore: Fire only when score ≥ minimum")
-sigQuality = input.string("⭐ +", "Signal Quality Filter", 
-     options = ["All Signals", "⭐ +", "⭐⭐ +", "⭐⭐⭐ Only"], 
+grp_sig = "Signal"
+sigQuality = input.string("⭐ +", "Score Stars",
+     options = ["All Signals", "⭐ +", "⭐⭐ +", "⭐⭐⭐ Only"],
      group = grp_sig,
-     tooltip = "Filter which quality signals to display:\n" +
-               "• All Signals: Show all (including ⚠️ WEAK)\n" +
-               "• ⭐ GOOD+: Show GOOD, STRONG, EXCELLENT\n" +
-               "• ⭐⭐ STRONG+: Show STRONG, EXCELLENT\n" +
-               "• ⭐⭐⭐ EXCELLENT Only: Show only top-tier setups")
-
-minScoreBuy= input.int(50, "Min Score for BUY Signal", minval = 0, maxval = 70, group = grp_sig,
-     tooltip = "Minimum score required for BUY label (Score mode only)\nMax 70 to allow ⭐⭐⭐ EXCELLENT rating (threshold + 30)")
-
-minScoreSell= input.int(50, "Min Score for SELL Signal", minval = 0, maxval = 70, group = grp_sig,
-     tooltip = "Minimum score required for SELL label (Score mode only)\nMax 70 to allow ⭐⭐⭐ EXCELLENT rating (threshold + 30)")
-
-// Entry freshness constraint (Score mode only)
-maxBarsFromFlip = input.int(0, "Max Bars From Flip (Score mode)", minval = 0, maxval = 50, group = grp_sig,
-     tooltip = "SCORE MODE ONLY — Trend mode is unaffected (it already fires on the\n" +
-               "flip bar by definition).\n\n" +
-               "0 (default): Disabled — Score mode can fire on any bar the score\n" +
-               "clears the threshold, no matter how far past the anchor flip.\n\n" +
-               "1-50: Score-mode signals only fire within this many bars of the\n" +
-               "most recent trendUp/trendDown flip. Prevents entries deep into an\n" +
-               "already-extended move (the Stretch gate catches this too, but only\n" +
-               "when Enable Risk Gates = true — this works independent of that).\n\n" +
-               "Calibrate using 'Bars From Flip' in Extended Metrics.")
-
-useSessionFilter = input.bool(true, "RTH Session Filter (9:30–4:00 PM ET)", group = grp_sig,
-     tooltip = "Only fire signals during regular trading hours (9:30 AM – 4:00 PM ET, Mon–Fri).\n\n" +
-               "When ON: Signals are suppressed outside market hours.\n" +
-               "State resets at session open so the first RTH bar can fire\n" +
-               "freely without carryover from overnight.")
-
-gateOn = input.bool(true, "Enable Risk Gates", group = grp_sig,
-     tooltip = "ENFORCEMENT MODE (ON, default): Gates apply penalties to score\n" +
-               "ADVISORY MODE (OFF): Gates show warnings but don't affect score\n\n" +
-               "RISK GATES ARE ALWAYS VISIBLE:\n" +
-               "• ON → 'Gates: 🚧 SQUEEZE (-30)'\n" +
-               "• OFF → 'Risks: 🚧 SQUEEZE (-30)'\n\n" +
-               "RISK GATES (4 total - pure risk filters):\n" +
-               "1. Squeeze: -30 when BB inside KC (range-bound)\n" +
-               "2. Stretch: -10/-20 when price extended from EMA20 or flip\n" +
-               "3. ATR Fuel: -25 when session range exceeds the profile's\n" +
-               "   fuel limit (75-95% of daily ATR-14, asset-dependent)\n" +
-               "4. Liquidity: -25 when RVOL is below the profile's RVOL\n" +
-               "   gate (0.6-1.2x, asset-dependent) AND ADX is choppy\n\n" +
-               "Default ON: Gates 1 (Squeeze) and 4 (Liquidity) directly\n" +
-               "suppress the low-ADX/range-bound chop entries that drove\n" +
-               "losing whipsaw signals in backtesting (see roadmap.md).\n\n" +
-               "NOTE: Breakout bonus moved to Component 5 (always active)")
-
-rvolMode = input.string("Time-of-Day", "Relative Volume Mode",
-     options = ["Rolling 20-bar", "Time-of-Day"],
-     group = grp_sig,
-     tooltip = "ROLLING 20-BAR:\n" +
-               "• Compares volume to the trailing 20-bar SMA\n" +
-               "• On a 2-min chart this is a 40-minute trailing average\n" +
-               "• Biased: overstates RVOL near the open, understates it at lunch\n\n" +
-               "TIME-OF-DAY (default):\n" +
-               "• Compares volume to the SAME intraday bar-slot's average\n" +
-               "  volume across the prior 'RVOL Lookback Sessions'\n" +
-               "• Removes the U-shaped intraday volume bias\n" +
-               "• Falls back to Rolling 20-bar automatically when fewer than\n" +
-               "  3 historical sessions exist at that slot (new listings,\n" +
-               "  short chart history)")
-
-rvolLookbackDays = input.int(10, "RVOL Lookback Sessions", minval = 3, maxval = 20, group = grp_sig,
-     tooltip = "Number of prior sessions averaged per intraday bar-slot for\n" +
-               "Time-of-Day RVOL mode. Only used when Relative Volume Mode = Time-of-Day.")
-
-grp_orb = "🔔 Opening Range Breakout"
-orbEnabled = input.bool(true, "Enable ORB Module", group = grp_orb,
-     tooltip = "Adds an Opening Range Breakout strategy alongside Trend Pullback.\n\n" +
-               "RANGE: high/low of the first N minutes of the RTH session.\n" +
-               "ENTRY: the first confirmed close that clears a range edge (by the\n" +
-               "        breakout buffer) — one breakout per session.\n" +
-               "ROUTER: during its window an ORB breakout preempts a same-bar\n" +
-               "        Trend Pullback signal.\n\n" +
-               "REQUIRES the RTH Session Filter ON — the range is anchored to the\n" +
-               "session open. With the filter OFF the range never locks and the\n" +
-               "module stays inert.")
-orbMinutes = input.int(30, "Opening Range (minutes)", minval = 5, maxval = 120, step = 5, group = grp_orb,
-     tooltip = "Length of the opening range, measured from the RTH open.")
-orbEntryCutoffMin = input.int(120, "Entry Cutoff (minutes from open)", minval = 15, maxval = 390, step = 15, group = grp_orb,
-     tooltip = "No ORB entry after this many minutes past the open (still at most one per session).")
-orbBufferATR = input.float(0.05, "Breakout Buffer (ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = grp_orb,
-     tooltip = "Price must clear the range edge by this many ATR(14) before the break counts. 0 = touch triggers.")
-orbMinRvol = input.float(1.2, "Min RVOL on Breakout", minval = 0.0, maxval = 5.0, step = 0.1, group = grp_orb,
-     tooltip = "Require relative volume at least this on the breakout bar. 0 disables the check.")
-orbRequireVwapSide = input.bool(true, "Require VWAP Alignment", group = grp_orb,
-     tooltip = "Long breakouts only when close > VWAP; short breakouts only when close < VWAP.")
-orbMinQuality = input.int(45, "Min ORB Setup Quality", minval = 0, maxval = 100, step = 5, group = grp_orb,
-     tooltip = "Minimum orb_quality (0-100: range geometry + breakout volume + VWAP/trend alignment + ATR fuel left) required to fire.")
-orbShowLevels = input.bool(true, "Plot ORB Levels", group = grp_orb,
-     tooltip = "Draw the locked opening-range high/low as horizontal lines for the session.")
-
-grp_fade = "🔄 VWAP Fade (Mean Reversion)"
-fadeEnabled = input.bool(false, "Enable VWAP Fade Module", group = grp_fade,
-     tooltip = "COUNTER-TREND module. When price stretches past VWAP ± (fade band x\n" +
-               "ATR-14), stalls, and closes back inside the band on a reversal bar,\n" +
-               "fade the excursion back toward VWAP.\n\n" +
-               "ELIGIBILITY: only in RANGE or EXHAUSTED regime and ADX below 1.5x the\n" +
-               "profile minimum — never fades a live trend or a fresh breakout.\n" +
-               "ROUTER: a fade preempts a same-bar Trend Pullback signal (opposite\n" +
-               "stances), but an ORB breakout preempts the fade.\n\n" +
-               "Default OFF — opt in deliberately. One fade per excursion; the arm\n" +
-               "resets once price reverts through VWAP or a new session opens.")
-fadeBandATR = input.float(2.0, "Fade Band (ATR from VWAP)", minval = 0.5, maxval = 6.0, step = 0.25, group = grp_fade,
-     tooltip = "How far past VWAP (in ATR-14 units) price must trade to arm a fade.")
-fadeMaxRvol = input.float(2.0, "Max RVOL to Fade", minval = 0.0, maxval = 10.0, step = 0.5, group = grp_fade,
-     tooltip = "Skip the fade if relative volume is at or above this on the reversal bar\n" +
-               "(a volume-backed thrust is a breakout, not an exhaustion). 0 disables.")
-fadeMinQuality = input.int(50, "Min Fade Setup Quality", minval = 0, maxval = 100, step = 5, group = grp_fade,
-     tooltip = "Minimum fade_quality (0-100: excursion size + reversal-bar strength +\n" +
-               "volume calm + regime) required to fire.")
-fadeShowBands = input.bool(true, "Plot Fade Bands", group = grp_fade,
-     tooltip = "Draw the VWAP ± fade-band edges as horizontal lines.")
+     tooltip = "How selective the BUY/SELL labels are, on top of the auto min score:\n" +
+               "• All Signals: show everything (including ⚠️ WEAK)\n" +
+               "• ⭐ +: GOOD, STRONG, EXCELLENT\n" +
+               "• ⭐⭐ +: STRONG, EXCELLENT\n" +
+               "• ⭐⭐⭐ Only: top-tier setups only")
 
 grp_pnl = "💰 P&L Exit Signals"
 enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
-     tooltip = "Track and display PROFIT/LOSS exit signals when price moves ±target% from entry")
+     tooltip = "Show PROFIT/LOSS exit markers when price moves ±target % from entry.")
 pnlTarget = input.float(1.0, "P&L Target (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = grp_pnl,
-     tooltip = "Exit signal fires at ±this percentage. Default: 1.0%")
+     tooltip = "PROFIT/LOSS fires at ±this percent from entry. Default 1.0%.")
 
-showSignalPnL = input.bool(true, "📊 Show Signal P&L History", group = grp_pnl,
-     tooltip = "Display actual % gain/loss between consecutive signals.\n\n" +
-               "HOW IT WORKS:\n" +
-               "• Calculates P&L from previous signal (any direction)\n" +
-               "• BUY→BUY: Long gain/loss\n" +
-               "• SELL→SELL: Short gain/loss\n" +
-               "• BUY→SELL or SELL→BUY: Position reversal P&L\n\n" +
-               "WHAT IT'S FOR:\n" +
-               "• See incremental value of each signal\n" +
-               "• Identify whipsaw periods (red P&Ls)\n" +
-               "• Validate signal timing effectiveness\n\n" +
-               "INDEPENDENT FROM:\n" +
-               "• Live dashboard P&L (tracks current position)\n" +
-               "• PROFIT/LOSS exit signals (±target %)")
+//======================================================================
+// FIXED BEHAVIOUR
+// User-configurable in the parent script; pinned here to the tuned
+// defaults so the light build stays a 3-control surface.
+//======================================================================
+bool   showLabels        = true
+string sigTime           = "Score"        // fire only when score clears the auto minimum
+bool   gateOn            = true            // risk gates always enforced
+string rvolMode          = "Time-of-Day"  // auto-falls back to 20-bar on thin history
+int    rvolLookbackDays  = 10
+bool   enableSuccessRate = true
+int    maxSignalsToTrack = 50
+bool   showSignalPnL     = true
+bool   showDash          = true
+bool   extDash           = false
+bool   showCircles       = true
+bool   showBg            = true
 
-grp_success = "📊 Success Rate Tracking"
-enableSuccessRate = input.bool(true, "Enable Success Rate Tracking", group = grp_success,
-     tooltip = "Track win/loss statistics for BUY and SELL signals\n\n" +
-               "DISPLAYS:\n" +
-               "• Separate BUY and SELL win rates\n" +
-               "• Raw counts (e.g., '65.4% [17/26]')\n" +
-               "• Color-coded performance (Green/Yellow/Red)\n\n" +
-               "LOCATION:\n" +
-               "• Dashboard Extended Metrics section\n" +
-               "• Only visible when Extended Metrics enabled\n\n" +
-               "BENEFITS:\n" +
-               "• Validate parameter changes objectively\n" +
-               "• Detect directional bias (BUY vs SELL)\n" +
-               "• Monitor system performance over time")
-
-maxSignalsToTrack = input.int(50, "Max Signals to Track", minval = 10, maxval = 500, step = 10, group = grp_success,
-     tooltip = "Rolling window: Track success rate over last N signals\n\n" +
-               "SMALLER VALUES (10-50):\n" +
-               "• More responsive to recent performance\n" +
-               "• Shows current market regime\n" +
-               "• Higher volatility in rates\n\n" +
-               "LARGER VALUES (100-500):\n" +
-               "• More stable long-term statistics\n" +
-               "• Less affected by temporary fluctuations\n" +
-               "• Better for overall system evaluation\n\n" +
-               "RECOMMENDED:\n" +
-               "• Day Trading: 50-100 signals\n" +
-               "• Swing Trading: 100-200 signals\n" +
-               "• System Validation: 200-500 signals")
-
-grp_vis = "Dashboard & Visuals"
-showDash = input.bool(true, "Show Dashboard", group = grp_vis)
-extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
-     tooltip = "Show detailed point breakdown for each component")
-showCircles = input.bool(true, "Show Trend Flip Circles", group = grp_vis)
-showBg   = input.bool(true, "Show Trend Background", group = grp_vis)
+// ORB strategy module — retired in the light build. Kept inert
+// (orbEnabled = false) so the router / dashboard / plot code that still
+// references these names compiles; none of that path is reachable.
+bool  orbEnabled         = false
+int   orbMinutes         = 30
+int   orbEntryCutoffMin  = 120
+float orbBufferATR       = 0.05
+float orbMinRvol         = 1.2
+bool  orbRequireVwapSide = true
+int   orbMinQuality      = 45
+bool  orbShowLevels      = false
 
 
 //======================================================================
@@ -323,7 +138,12 @@ float ext_scale    = 2.5   // Overextension ATR Multiplier (default)
 float fuel_max     = 85.0  // ATR Fuel Limit (default)
 int   ema_max      = 20    // EMA Cascade max points (default)
 int   vwap_max     = 25    // VWAP Value max points (default)
-int   sma_len      = 70    // SMA anchor length, AUTO mode (default)
+int   sma_len      = 70    // SMA anchor length (default)
+// SLT-light auto-tune fields (resolved to effective params after this chain)
+int   ema_slow_auto  = 30    // EMA Cross slow leg
+float sma_buf_auto   = 0.25  // SMA latch band (x ATR-14)
+int   min_score_auto = 50    // auto min score, both directions
+bool  rth_auto       = true  // RTH session filter (off for 24h profiles)
 string profile_name = "DEFAULT"
 
 // 3. Profile Assignment Logic
@@ -338,6 +158,10 @@ if asset_category == "MARKET"
     ema_max := 22    // EMA Cascade max points (default)
     vwap_max := 23    // VWAP Value max points (default)
     sma_len := 90     // Slower anchor — indices grind, few clean crosses
+    ema_slow_auto := 30
+    sma_buf_auto := 0.20
+    min_score_auto := 55
+    rth_auto := true
 
 else if asset_category == "FUND"
     profile_name := "ETF / FUND 📊"
@@ -350,6 +174,10 @@ else if asset_category == "FUND"
     ema_max := 20    // EMA Cascade max points (default)
     vwap_max := 25    // VWAP Value max points (default)
     sma_len := 90     // Smooth trends — longer average holds structure
+    ema_slow_auto := 30
+    sma_buf_auto := 0.20
+    min_score_auto := 50
+    rth_auto := true
 
 else if asset_category == "STOCK"
     profile_name := "STOCK 🚀"
@@ -362,6 +190,10 @@ else if asset_category == "STOCK"
     ema_max := 20    // EMA Cascade max points (default)
     vwap_max := 25    // VWAP Value max points (default)
     sma_len := 70     // Source-script baseline — ~2.3h on a 2-min chart
+    ema_slow_auto := 20
+    sma_buf_auto := 0.25
+    min_score_auto := 50
+    rth_auto := true
 
 else if asset_category == "FUTURES"
     profile_name := "FUTURES ⚡"
@@ -374,6 +206,10 @@ else if asset_category == "FUTURES"
     ema_max := 30    // EMA Cascade max points (default)
     vwap_max := 15    // VWAP Value max points (default)
     sma_len := 70     // Matches the CL/crude source script this was drawn from
+    ema_slow_auto := 30
+    sma_buf_auto := 0.30
+    min_score_auto := 45
+    rth_auto := false   // 24h contract — RTH filter would blackout most of the day
 
 else if asset_category == "CRYPTO"
     profile_name := "CRYPTO 🪙"
@@ -386,27 +222,44 @@ else if asset_category == "CRYPTO"
     ema_max := 25    // EMA Cascade max points (default)
     vwap_max := 20    // VWAP Value max points (default)
     sma_len := 120    // 24h trading — needs a much longer window per "session"
+    ema_slow_auto := 20
+    sma_buf_auto := 0.35
+    min_score_auto := 55
+    rth_auto := false   // 24h market — RTH filter would blackout most of the day
 
 else
     profile_name := "STANDARD STOCK 📈" // Defaults already set above
 
 //======================================================================
+// AUTO-TUNE RESOLUTION  (asset profile + anchor -> effective parameters)
+// These names are what the rest of the script reads; in the parent
+// project they were user inputs.
+//======================================================================
+int   emaSlowPeriod    = ema_slow_auto                     // EMA Cross slow leg (20 / 30 by profile)
+float smaBufferATR     = sma_buf_auto                      // SMA latch band, x ATR-14
+int   minScoreBuy      = min_score_auto                    // auto min score, both directions
+int   minScoreSell     = min_score_auto
+bool  useSessionFilter = rth_auto                          // RTH filter — off for 24h profiles (FUTURES / CRYPTO)
+// Entry-freshness cap (Score mode only): EMA9/slow crosses lag the turn, so
+// cap how far past a flip an entry may fire; the SMA anchor is latched and
+// already fires on the flip bar, so it needs no cap.
+int   maxBarsFromFlip  = anchorMode == "SMA" ? 0 : 10
+
+//======================================================================
 // CORE INDICATOR CALCULATIONS
 //======================================================================
 
-// Dynamic EMA calculation based on user selection
-// EMAs (9 + user-selected slow period for EMA Cross, 50 for cascade scoring)
+// EMAs (9 + profile slow period for EMA Cross, 50 for cascade scoring)
 ema9  = ta.ema(close, 9)
-emaSlow = ta.ema(close, emaSlowPeriod)  // User choice: 20 or 30
+emaSlow = ta.ema(close, emaSlowPeriod)
 ema50 = ta.ema(close, 50)
 
 // Keep ema20 reference for Component 1 scoring (always uses 20)
 ema20 = ta.ema(close, 20)
 
 // SMA anchor — only drives signals when anchorMode == "SMA", but computed on
-// every bar like every other series here. AUTO takes the per-profile length
-// assigned above; MANUAL takes the user input.
-int smaLenActive = smaMode == "AUTO" ? sma_len : smaLen_manual
+// every bar like every other series here. Length is the per-profile sma_len.
+int smaLenActive = sma_len
 smaAnchor = ta.sma(close, smaLenActive)
 
 // VWAP (Session-based - Component 2)
@@ -1325,95 +1178,14 @@ bool orb_short = orbEnabled and in_session and barstate.isconfirmed and not orb_
 if orb_long or orb_short
     orb_done := true
 
-// --- Module: VWAP Fade (mean reversion) ---------------------------------
-// Counter-trend. Arm when price trades past VWAP ± fadeBandATR x ATR-14;
-// fire when it closes back inside the band on a reversal bar, targeting a
-// reversion toward VWAP. One fade per excursion — the arm + fired latch
-// reset only when price reverts through VWAP (or a new session opens), so
-// the same excursion cannot fire twice. Eligible only in RANGE / EXHAUSTED
-// regime with ADX < 1.5x the profile minimum: never fades a live trend or a
-// fresh breakout. Non-repainting: state advances on confirmed bars only.
-float fade_band    = fadeBandATR * atr
-float fade_up_edge = not na(vwap) and not na(fade_band) ? vwap + fade_band : na
-float fade_dn_edge = not na(vwap) and not na(fade_band) ? vwap - fade_band : na
-
-var bool  fade_armed_up = false   // price has traded above the upper edge this excursion
-var bool  fade_armed_dn = false
-var float fade_peak_up  = na      // max (high - vwap) during the current up excursion
-var float fade_peak_dn  = na      // max (vwap - low)  during the current down excursion
-var bool  fade_fired_up = false   // a short fade already taken for this up excursion
-var bool  fade_fired_dn = false
-
-if session_just_opened
-    fade_armed_up := false
-    fade_armed_dn := false
-    fade_peak_up := na
-    fade_peak_dn := na
-    fade_fired_up := false
-    fade_fired_dn := false
-
-if barstate.isconfirmed and fadeEnabled and in_session and not na(vwap) and not na(fade_band)
-    // Up excursion: arm + track peak while stretched; deep-reset once price
-    // reverts back through VWAP.
-    if high > fade_up_edge
-        fade_armed_up := true
-        fade_peak_up  := na(fade_peak_up) ? high - vwap : math.max(fade_peak_up, high - vwap)
-    if close < vwap
-        fade_armed_up := false
-        fade_peak_up  := na
-        fade_fired_up := false
-    // Down excursion (mirror)
-    if low < fade_dn_edge
-        fade_armed_dn := true
-        fade_peak_dn  := na(fade_peak_dn) ? vwap - low : math.max(fade_peak_dn, vwap - low)
-    if close > vwap
-        fade_armed_dn := false
-        fade_peak_dn  := na
-        fade_fired_dn := false
-
-bool fade_regime_ok = (regime == "RANGE" or regime == "EXHAUSTED") and adx < adx_min * 1.5
-bool fade_calm      = fadeMaxRvol <= 0 or rel_vol < fadeMaxRvol
-
-// Reversal trigger: was stretched, now closing back inside the band, on a
-// bar that closes against the excursion with momentum rolling over.
-bool fade_short_trig = fade_armed_up and not fade_fired_up and close < fade_up_edge and close < open and rsiVal < rsiVal[1]
-bool fade_long_trig  = fade_armed_dn and not fade_fired_dn and close > fade_dn_edge and close > open and rsiVal > rsiVal[1]
-
-// Setup quality (0-100): excursion size + reversal-bar strength + volume calm + regime
-float fade_excursion_atr = atr > 0 ? (fade_short_trig ? fade_peak_up / atr : (fade_long_trig ? fade_peak_dn / atr : na)) : na
-int fade_q = 0
-if not na(fade_excursion_atr)
-    fade_q := fade_excursion_atr >= 1.5 and fade_excursion_atr <= 4.0 ? 35 : (fade_excursion_atr >= 1.0 and fade_excursion_atr <= 6.0 ? 20 : 8)
-fade_q += (((fade_short_trig and (high - close) > (close - low)) or (fade_long_trig and (close - low) > (high - close))) ? 25 : 10)
-fade_q += (rel_vol < 1.0 ? 20 : (rel_vol < 1.5 ? 10 : 0))
-fade_q += (regime == "EXHAUSTED" ? 20 : (regime == "RANGE" ? 12 : 0))
-int fade_quality = math.min(fade_q, 100)
-
-bool fade_long  = fadeEnabled and in_session and barstate.isconfirmed and fade_regime_ok and fade_calm and
-   fade_long_trig and fade_quality >= fadeMinQuality
-bool fade_short = fadeEnabled and in_session and barstate.isconfirmed and fade_regime_ok and fade_calm and
-   fade_short_trig and fade_quality >= fadeMinQuality
-
-if fade_short
-    fade_fired_up := true
-if fade_long
-    fade_fired_dn := true
-
 // --- Regime router -------------------------------------------------------
-// Priority (last write wins): Trend Pullback (default) < VWAP Fade < ORB.
-// Fade sits above Trend Pullback because the two are opposite stances — the
-// fade's regime gate is what keeps both from being eligible in the same
-// backdrop. An ORB breakout (time-boxed, once per session) tops both.
+// Priority (last write wins): Trend Pullback (default) < ORB.
+// (The VWAP Fade counter-trend module from the parent project is removed in
+// the light build; ORB is retired-but-inert, orbEnabled = false.)
 string active_strategy = "Trend Pullback"
 int    strat_quality   = tp_quality
 bool   strat_long      = tp_long
 bool   strat_short     = tp_short
-
-if fade_long or fade_short
-    active_strategy := "VWAP Fade"
-    strat_quality   := fade_quality
-    strat_long      := fade_long
-    strat_short     := fade_short
 
 if orb_long or orb_short
     active_strategy := "ORB"
@@ -1424,7 +1196,7 @@ if orb_long or orb_short
 // --- Setup quality rating (of the active strategy) ----------------------
 // stars drives the BUY/SELL chart labels. Reads strat_quality (the active
 // module's 0-100 quality) rather than final_score directly: Trend Pullback
-// -> final_score, ORB -> orb_quality, VWAP Fade -> fade_quality.
+// -> final_score, ORB -> orb_quality (inert in the light build).
 int active_threshold = is_bull ? minScoreBuy : minScoreSell
 string stars = strat_quality >= active_threshold + 30 ? "⭐⭐⭐" :
    strat_quality >= active_threshold + 15 ? "⭐⭐" :
@@ -1617,17 +1389,11 @@ plot(orbShowLevels and orb_locked and in_session ? orb_high : na, "ORB High",
 plot(orbShowLevels and orb_locked and in_session ? orb_low : na, "ORB Low",
      color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 1)
 
-// VWAP Fade band edges (teal; only while the fade module is enabled)
-plot(fadeEnabled and in_session and not na(fade_up_edge) ? fade_up_edge : na, "VWAP Fade Upper",
-     color = color.new(color.teal, 40), style = plot.style_linebr, linewidth = 1)
-plot(fadeEnabled and in_session and not na(fade_dn_edge) ? fade_dn_edge : na, "VWAP Fade Lower",
-     color = color.new(color.teal, 40), style = plot.style_linebr, linewidth = 1)
-
 //======================================================================
 // BUY/SELL LABELS WITH ANCHOR-AWARE POSITIONING
 //======================================================================
 if signal_buy and showLabels
-    string label_text = "BUY " + stars + (active_strategy == "ORB" ? " ⚡ORB" : active_strategy == "VWAP Fade" ? " 🔄FADE" : "")
+    string label_text = "BUY " + stars + (active_strategy == "ORB" ? " ⚡ORB" : "")
 
     if showSignalPnL and not na(signal_pnl)
         label_text += "\n" + str.tostring(signal_pnl, "+#.##;-#.##") + "%"
@@ -1643,7 +1409,7 @@ if signal_buy and showLabels
          size = size.normal)
 
 if signal_sell and showLabels
-    string label_text = "SELL " + stars + (active_strategy == "ORB" ? " ⚡ORB" : active_strategy == "VWAP Fade" ? " 🔄FADE" : "")
+    string label_text = "SELL " + stars + (active_strategy == "ORB" ? " ⚡ORB" : "")
 
     if showSignalPnL and not na(signal_pnl)
         label_text += "\n" + str.tostring(signal_pnl, "+#.##;-#.##") + "%"
@@ -1777,11 +1543,9 @@ if showDash and barstate.islast
     // Signal Anchor Display with dynamic EMA period
     string anchor_display = ""
     if anchorMode == "SMA"
-        anchor_display := "SMA (" + str.tostring(smaLenActive) + ")"
-        anchor_display += smaMode == "AUTO" ? " AUTO" : " MANUAL"
-        anchor_display += " ±" + str.tostring(smaBufferATR, "#.##") + "A"
+        anchor_display := "SMA (" + str.tostring(smaLenActive) + ") auto ±" + str.tostring(smaBufferATR, "#.##") + "A"
     else  // EMA Cross
-        anchor_display := "EMA Cross (9/" + str.tostring(emaSlowPeriod) + ")"
+        anchor_display := "EMA Cross (9/" + str.tostring(emaSlowPeriod) + ") auto"
     
     table.cell(d, 0, row, "Signal Anchor", text_color = color.white, text_halign = text.align_left, text_size = size.small)
     table.cell(d, 1, row, anchor_display, text_color = color.gray, text_size = size.small)
@@ -1806,17 +1570,6 @@ if showDash and barstate.islast
                           "armed " + str.tostring(orb_high, format.mintick) + " / " + str.tostring(orb_low, format.mintick) + "  Q" + str.tostring(orb_quality)
         table.cell(d, 0, row, "ORB", text_color = color.white, text_halign = text.align_left, text_size = size.small)
         table.cell(d, 1, row, orb_dash, text_color = color.gray, text_size = size.small)
-        row += 1
-
-    // VWAP Fade module status (optional row — only when the module is enabled)
-    if fadeEnabled
-        string fade_dash = na(vwap) ? "no VWAP" :
-                           not fade_regime_ok ? "idle (" + regime + ")" :
-                           fade_armed_up ? "stretched ↑ " + str.tostring(fade_peak_up / atr, "#.#") + " ATR" + (fade_fired_up ? " · done" : "") :
-                           fade_armed_dn ? "stretched ↓ " + str.tostring(fade_peak_dn / atr, "#.#") + " ATR" + (fade_fired_dn ? " · done" : "") :
-                           "watching  ±" + str.tostring(fadeBandATR, "#.#") + " ATR"
-        table.cell(d, 0, row, "VWAP Fade", text_color = color.white, text_halign = text.align_left, text_size = size.small)
-        table.cell(d, 1, row, fade_dash, text_color = color.gray, text_size = size.small)
         row += 1
 
     // ATR Fuel
@@ -1910,12 +1663,12 @@ if showDash and barstate.islast
              text_size = size.small)
         row += 1
 
-        // Per-module win rate (Phase 4). One indented row per module, shown
-        // only for modules that can currently produce signals: Trend Pullback
-        // always, ORB when orbEnabled, VWAP Fade when fadeEnabled. Combined
-        // BUY+SELL, "—" until that module has a resolved signal.
+        // Per-module win rate (Phase 4). One indented row per module that can
+        // currently produce signals: Trend Pullback always, ORB when orbEnabled
+        // (retired-but-inert in the light build). Combined BUY+SELL, "—" until
+        // that module has a resolved signal.
         for mi = 0 to 2
-            bool mi_show = mi == 0 or (mi == 1 and orbEnabled) or (mi == 2 and fadeEnabled)
+            bool mi_show = mi == 0 or (mi == 1 and orbEnabled)
             if mi_show and row < DASHBOARD_MAX_ROWS
                 ModResults mr = array.get(mod_results, mi)
                 string mname = mi == 1 ? "ORB" : mi == 2 ? "VWAP Fade" : "Trend Pull"

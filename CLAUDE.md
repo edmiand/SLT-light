@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **Pine Script v6 TradingView indicator** — a single-file intraday momentum trading system, **forked from SuperLazyTrade with the SuperTrend signal anchor removed**. The sole source file is `SLT.pine`. There is no build system, package manager, or test runner; development means editing the `.pine` file and pasting it into TradingView's Pine Editor to compile and validate.
 
-SLT keeps two signal anchors: **SMA** (default) and **EMA Cross**. Everything else — the 5-component scoring engine, the 4 risk gates, both P&L tracking systems, win-rate tracking, and the dashboard — is unchanged from the parent project.
+SLT keeps two signal anchors: **SMA** (default) and **EMA Cross**. The 5-component scoring engine, the 4 risk gates, both P&L tracking systems, win-rate tracking, and the dashboard are carried over from the parent project.
+
+**Light build — 3 user controls only.** The settings panel exposes exactly: **Signal Anchor** (EMA Cross / SMA), **Score Stars** (`sigQuality`), and **P&L Exit** (`enablePnL` + `pnlTarget`). Every other parameter that was a user input in the parent script is either **auto-tuned** from the asset profile + anchor choice (see [Auto-Tune](#auto-tune-light-build) and the [Profile Parameters Table](#profile-parameters-table)) or **pinned** to its tuned default in a `FIXED BEHAVIOUR` block near the top of the file. The **VWAP Fade** module is removed entirely; the **ORB** module is retired but left inert (`orbEnabled = false` constant) so its router/dashboard/plot code still compiles. To change a tuned value, edit the profile `if/else` chain — not the panel.
 
 ## Development Workflow
 
@@ -21,34 +23,31 @@ SLT keeps two signal anchors: **SMA** (default) and **EMA Cross**. Everything el
 The script is organized into sequential sections (read top-to-bottom, order matters in Pine Script):
 
 1. **Constants** — Gate penalty values, dashboard sizing (`DASHBOARD_MAX_ROWS = 36`)
-2. **Inputs** — All user-configurable parameters grouped by function:
-   - `grp_anchor`: Signal Anchor (EMA Cross / SMA) + EMA slow period
-   - `grp_sma`: SMA anchor length mode (AUTO / MANUAL), manual length, ATR buffer multiplier
-   - `grp_sig`: Signal timing, quality filter, min scores, RTH session filter, gate enforcement
-   - `grp_orb`: Opening Range Breakout module — enable, range minutes, entry cutoff, breakout buffer, min RVOL, VWAP alignment, min setup quality, plot levels
-   - `grp_fade`: VWAP Fade module — enable (default OFF), fade band (ATR), max RVOL, min setup quality, plot bands
-   - `grp_pnl`: P&L exit signals, target %, signal P&L history
-   - `grp_success`: Success rate tracking, rolling window size
-   - `grp_vis`: Dashboard visibility, extended metrics, circles, background
-3. **Asset profile assignment** — A `switch` on `syminfo.type` first computes `asset_category` (STOCK/FUND/FUTURES/CRYPTO/MARKET); a separate `if/else if` chain keyed on `asset_category` then sets `profile_name` and all threshold variables used throughout scoring, including the SMA anchor length `sma_len` (it keys on `asset_category`, so it is set here rather than per-ticker). See [Profile Parameters Table](#profile-parameters-table).
-4. **Core indicator calculations** — EMAs (9, `emaSlow`=user-choice 20 or 30, 20 fixed for scoring, 50), SMA anchor, VWAP, ATR(14), RSI(14), ADX(14,14), MACD(12,26,9), relative volume (`rvolMode`: Time-of-Day default, Rolling 20-bar SMA fallback/alternative — see [Time-of-Day Relative Volume](#key-design-decisions))
+2. **Inputs** — Three user controls only (see [Auto-Tune](#auto-tune-light-build)):
+   - `grp_anchor`: **Signal Anchor** (EMA Cross / SMA) — the mode selector; drives auto-tune
+   - `grp_sig`: **Score Stars** (`sigQuality`) — label selectivity on top of the auto min score
+   - `grp_pnl`: **P&L Exit** — `enablePnL` + `pnlTarget`
+   - `FIXED BEHAVIOUR` block: `showLabels`, `sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, success-rate + dashboard toggles — all pinned constants, no inputs.
+   - ORB inert-constant block: `orbEnabled=false` + the 7 ORB tuning constants (module code still present).
+3. **Asset profile assignment** — A `switch` on `syminfo.type` first computes `asset_category` (STOCK/FUND/FUTURES/CRYPTO/MARKET); a separate `if/else if` chain keyed on `asset_category` then sets `profile_name`, all scoring threshold variables, the SMA anchor length `sma_len`, **and the four auto-tune fields** `ema_slow_auto` / `sma_buf_auto` / `min_score_auto` / `rth_auto`. Immediately after the chain, an **AUTO-TUNE RESOLUTION** block maps those (plus the anchor choice) to the effective globals the rest of the script reads: `emaSlowPeriod`, `smaBufferATR`, `minScoreBuy`/`minScoreSell` (both = `min_score_auto`), `useSessionFilter` (= `rth_auto`), and `maxBarsFromFlip` (`anchorMode=="SMA" ? 0 : 10`). See [Profile Parameters Table](#profile-parameters-table).
+4. **Core indicator calculations** — EMAs (9, `emaSlow`=profile-auto 20 or 30, 20 fixed for scoring, 50), SMA anchor (`smaLenActive = sma_len`, no MANUAL mode), VWAP, ATR(14), RSI(14), ADX(14,14), MACD(12,26,9), relative volume (`rvolMode` pinned to Time-of-Day, Rolling 20-bar SMA is the automatic thin-history fallback — see [Time-of-Day Relative Volume](#key-design-decisions))
 5. **Market regime detection** — Squeeze state (BB(20,2) inside KC(20,1.5×ATR)), squeeze release + bias, stretch factor (EMA distance + trend move since flip), velocity override (ADX>35 rising 3 bars), ATR fuel gauge (session range vs daily ATR-14)
 6. **Dual-anchor trend classification** — EMA Cross or SMA mode; `is_bull`/`is_bear`/`trendUp`/`trendDown` unify both anchors behind a single interface, and `anchor_line_price`/`anchor_short` unify the *display* side. `trend_start_price` updated on every `trendUp`/`trendDown`. See [SMA Anchor](#sma-anchor).
 7. **Scoring engine** — 5 components summed to `raw_score` (capped at 100). Max theoretical total = 105 across all profiles. See [Scoring Components](#scoring-components).
 8. **Risk gates** — 4 gates calculate penalties; applied to `raw_score` → `final_score` only when `gateOn = true`; always shown as warnings regardless. See [Risk Gates](#risk-gates).
-9. **Signal generation** — Four sub-stages (regime-router refactor, **Phase 3**: three modules):
-   - **Regime classification** — `regime` string (`SQUEEZE` / `BREAKOUT` / `EXHAUSTED` / `TREND` / `RANGE`) derived from `is_squeezing`, `sqz_release`, `stretch_factor`, `adx`. Feeds the dashboard **and** gates the VWAP Fade module's eligibility (see below); still descriptive for Trend Pullback and ORB.
+9. **Signal generation** — Four sub-stages (regime-router refactor; light build runs **one live module**):
+   - **Regime classification** — `regime` string (`SQUEEZE` / `BREAKOUT` / `EXHAUSTED` / `TREND` / `RANGE`) derived from `is_squeezing`, `sqz_release`, `stretch_factor`, `adx`. Feeds the dashboard; purely descriptive now that VWAP Fade (its only non-descriptive consumer) is removed.
    - **Strategy modules** — each is fully self-gated and exposes `<name>_long` / `<name>_short` / `<name>_quality`:
-     - **Trend Pullback** (`tp_*`) — the anchor + 5-component confluence + `passes_quality_filter` logic, condition-for-condition unchanged from pre-refactor. `sigTime` ("Trend" fires off `trendUp`/`trendDown`; "Score" fires off `is_bull`/`is_bear` + `entry_is_fresh` + explicit `barstate.isconfirmed`) is a **mode of this module**. Both modes AND in `in_session` and `anchor_ready`. `tp_quality = final_score`.
-     - **ORB** (`orb_*`) — Opening Range Breakout. See [ORB Module](#orb-module).
-     - **VWAP Fade** (`fade_*`) — counter-trend mean reversion. See [VWAP Fade Module](#vwap-fade-module).
-   - **Regime router** — `active_strategy` / `strat_long` / `strat_short` / `strat_quality`, resolved last-write-wins: **Trend Pullback (default) → VWAP Fade → ORB**. VWAP Fade sits above Trend Pullback because they are opposite stances; the fade's `RANGE`/`EXHAUSTED` + `adx < 1.5×adx_min` gate is what keeps both from being live in the same backdrop. An ORB breakout tops both. The router only chooses between modules — it never loosens a module's own gating.
+     - **Trend Pullback** (`tp_*`) — the anchor + 5-component confluence + `passes_quality_filter` logic. `sigTime` is pinned to `"Score"` (fires off `is_bull`/`is_bear` + `entry_is_fresh` + explicit `barstate.isconfirmed`); `"Trend"` mode code is still present but unreachable. Both modes AND in `in_session` and `anchor_ready`. `tp_quality = final_score`.
+     - **ORB** (`orb_*`) — Opening Range Breakout, **inert** (`orbEnabled = false`). Code retained. See [ORB Module](#orb-module).
+     - ~~**VWAP Fade**~~ — removed entirely from the light build.
+   - **Regime router** — `active_strategy` / `strat_long` / `strat_short` / `strat_quality`, last-write-wins: **Trend Pullback (default) → ORB**. With ORB inert, the router always resolves to Trend Pullback. The router only chooses between modules — it never loosens a module's own gating.
    - **Signal dispatch** — `signal_buy = strat_long and not b_fired`, `signal_sell = strat_short and not s_fired`. `b_fired`/`s_fired` enforce strict BUY/SELL alternation **across all modules and any number of regime/trend flips**; they clear only when the opposite signal fires or at RTH session open (`useSessionFilter`-gated) — **not** on a trend-direction change by itself.
    Signals are non-repainting; `barstate.isconfirmed` guards every flip/breakout condition. `stars` (BUY/SELL chart labels) is computed just after the router off `strat_quality`, so it reflects the **active** module. RTH filter via `time(timeframe.period, "0930-1600:23456")` — `in_session`/`session_just_opened` are computed in their own **RTH Session Window** section placed *before* P&L exit tracking, because the session-open reset must flatten stale position state before `current_pnl` is evaluated on that same bar. Score-mode signals can also be constrained to fire only within `maxBarsFromFlip` bars of the anchor flip (default 0 = disabled); Trend mode is unaffected.
 10. **P&L tracking** — Two independent systems: (a) live dashboard P&L using `pnl_entry_price`/`pnl_direction`, reset on every new signal and flattened at RTH session open; (b) signal-to-signal `signal_pnl` history shown on labels. PROFIT/LOSS exit triggers are Fixed %-only: `current_pnl` vs `±pnlTarget`. Target/stop resolution (`target_reached`/`stop_reached`) is tracked internally regardless of `enablePnL`; `enablePnL` only gates the visible `signal_profit`/`signal_loss`.
 11. **Success rate tracking** — Rolling arrays (`buy_results`/`sell_results`), capped at `maxSignalsToTrack`; every signal is scored won/lost when the next opposite-direction signal closes it — won only if the target was reached during the entry, lost otherwise. **Phase 4:** the same result is *also* pushed into a per-module store (`mod_results`, a 3-slot `array<ModResults>` indexed by `strat_id()`), keyed by the module that **opened** the entry (`buy_entry_strategy`/`sell_entry_strategy`, stamped from `active_strategy` at open). Overall arrays stay module-blind; the dashboard shows both.
-12. **Visuals** — Conditional plots, one branch per anchor: EMA9 dynamic line (green/red), or SMA line (green/red) plus its grey ATR buffer band; flip circles at transition bars; BUY/SELL labels anchored to `anchor_line_price` (with a `⚡ORB` / `🔄FADE` tag when the router picked that module). Plus the locked **ORB high/low** (orange) and the **VWAP fade band edges** (teal), all `plot.style_linebr` (break between sessions), gated on `orbShowLevels` / `fadeShowBands`.
-13. **Dashboard** — `table.new` at `position.bottom_right` with `DASHBOARD_MAX_ROWS = 32`; rendered only on `barstate.islast`. The table is `var`, so every render starts with `table.clear(d, 0, 0, 1, DASHBOARD_MAX_ROWS - 1)` — without it, rows written by the variable-length gate-detail loop persist after a gate deactivates and keep showing a stale warning. The gate detail loop is the last section written; it has an explicit `if row >= DASHBOARD_MAX_ROWS: break` guard because it is the only variable-length section. All preceding rows are bounded by design. The first data row reports the **active anchor** (`Trend (EMA9)` or `Trend (SMA)`) and its own price. Both that row and the four BUY/SELL label sites read the shared `anchor_line_price`/`anchor_short` globals rather than each re-deriving the anchor. The **Strategy** row (formerly "Market State") shows `active_strategy · <regime>`. The **ORB** row (only when `orbEnabled`) shows `needs RTH filter` / `waiting for open` / `forming H/L` / `armed H/L Q<n>` / `fired this session`. The **VWAP Fade** row (only when `fadeEnabled`) shows `idle (<regime>)` / `watching ±<n> ATR` / `stretched ↑/↓ <n> ATR [· done]`. Under the BUY/SELL Win Rate rows, a **per-module win-rate** row (Phase 4) is drawn for each module that can currently fire — Trend Pull always, ORB when `orbEnabled`, VWAP Fade when `fadeEnabled` — showing combined `B <rate>% <w>/<t>   S <rate>% <w>/<t>` (`—` until resolved). `DASHBOARD_MAX_ROWS` was bumped 28→30→32→36 for these optional rows; a minimal config sees the original count. `dashboard_score` reads `strat_quality` (the active module's quality).
+12. **Visuals** — Conditional plots, one branch per anchor: EMA9 dynamic line (green/red), or SMA line (green/red) plus its grey ATR buffer band; flip circles at transition bars; BUY/SELL labels anchored to `anchor_line_price` (with a `⚡ORB` tag if ORB were ever active). The locked **ORB high/low** plot (orange, `plot.style_linebr`) is retained but gated on `orbShowLevels = false`, so it never draws. The VWAP fade band plots are deleted.
+13. **Dashboard** — `table.new` at `position.bottom_right` with `DASHBOARD_MAX_ROWS = 36`; rendered only on `barstate.islast`. The table is `var`, so every render starts with `table.clear(d, 0, 0, 1, DASHBOARD_MAX_ROWS - 1)`. The gate detail loop is the last section written; it has an explicit `if row >= DASHBOARD_MAX_ROWS: break` guard because it is the only variable-length section. The first data row reports the **active anchor** (`Trend (EMA9)` or `Trend (SMA)`) and its price. The **Signal Anchor** row shows the resolved auto values, e.g. `SMA (90) auto ±0.20A` or `EMA Cross (9/30) auto`. The **Strategy** row shows `active_strategy · <regime>` (always `Trend Pullback · …` in the light build). The **ORB** row renders only `if orbEnabled` → never. The **VWAP Fade** row is deleted. Under the BUY/SELL Win Rate rows, the **per-module win-rate** loop draws Trend Pull always and ORB only `if orbEnabled` (never); slot 2 (Fade) is unused. `dashboard_score` reads `strat_quality`. `DASHBOARD_MAX_ROWS` stays at 36 (headroom; the light build renders fewer rows than the old default since the ORB rows are gone).
 14. **Alerts** — Four `alertcondition` calls with plaintext messages: `"BUY"`, `"SELL"`, `"PROFIT"`, `"LOSS"`.
 
 ---
@@ -127,15 +126,12 @@ All 5 components sum to `raw_score`, capped at 100. Component maxes vary by prof
 
 The default `anchorMode` option (the other is EMA Cross). Selected when `anchorMode = "SMA"`.
 
-**Length** (`sma_len`) is assigned per asset profile in the profile block — see the `sma_len` column in the [Profile Parameters Table](#profile-parameters-table) — and resolved to `smaLenActive` by `smaMode`:
+**Length** (`sma_len`) is assigned per asset profile in the profile block — see the `sma_len` column in the [Profile Parameters Table](#profile-parameters-table). In the light build there is no MANUAL mode: `smaLenActive = sma_len` directly.
 
-- `smaMode = "AUTO"` (default) → per-profile `sma_len`
-- `smaMode = "MANUAL"` → `smaLen_manual` (default 70, range 10–300)
-
-**Flip semantics — ATR buffer band with latched state.** A raw `ta.crossover(close, sma)` whipsaws badly on a 2-min chart, and in Trend mode `trendUp` fires the signal directly off the flip, so the raw cross is not usable as-is. Instead:
+**Flip semantics — ATR buffer band with latched state.** A raw `ta.crossover(close, sma)` whipsaws badly on a 2-min chart, so the raw cross is not usable as-is. Instead:
 
 ```
-sma_band = smaBufferATR × ATR(14)          // default 0.25, range 0.0–2.0
+sma_band = smaBufferATR × ATR(14)          // smaBufferATR = sma_buf_auto (0.20–0.35 by profile)
 close > smaAnchor + sma_band  → latch BULL
 close < smaAnchor - sma_band  → latch BEAR
 inside the band               → hold previous state
@@ -147,15 +143,17 @@ inside the band               → hold previous state
 
 Flips derive from the latch by comparing against `sma_prev_bull`, a second `var bool` assigned from `sma_state_bull` *before* the update block each bar. This is deliberately not `sma_state_bull[1]`: that reads `na` on bar 0, making the flip booleans `na` rather than `false`, and `nz()` has no bool overload to default it with (`CE10123` — `nz` expects a numeric `source`). Because flips come from the latch, `trend_start_price` and `bars_since_flip` stay correct with no extra work, and `maxBarsFromFlip` applies to SMA mode in Score mode exactly as it does to EMA Cross.
 
-Setting `smaBufferATR = 0` degrades to a raw price/SMA cross (the source behavior) — expect substantially more flips.
+(`sma_buf_auto` is always > 0 in the light build; setting a profile value to 0 would degrade to a raw price/SMA cross with substantially more flips.)
 
-**Scoring interaction to be aware of:** the SMA anchor overlaps conceptually with Component 1 (EMA Cascade), which already scores price against `ema20`/`ema50`. In SMA mode the anchor is partly being scored by a related measure. Nothing breaks — the periods differ and the other four components are independent — but SMA-mode scores skew slightly higher on trend continuation, which matters when comparing win rates across the two anchor modes.
+**Scoring interaction (normalized):** Component 1 (EMA Cascade) conceptually overlaps the SMA anchor — both measure price against a slow average. This is neutralized by keying Component 1's bull/bear branch off `c1_bull`/`c1_bear` (`ema9` vs `ema20`) rather than `is_bull`/`is_bear`, so the component computes identically regardless of anchor (see [Scoring Components](#scoring-components) → Component 1). Before this, SMA-mode `raw_score` skewed higher on trend continuation because `is_bull` (price above a 70–120-bar SMA) almost always implied the full cascade. The other four components were already anchor-agnostic through the `is_bull`/`is_bear` interface; Component 1 is now the same. Residual note: `emaSlowPeriod` (20 vs 30) still shifts *anchor* flips in EMA Cross mode but never touches Component 1, which is fixed to `ema20`.
 
 ---
 
 ## ORB Module
 
-Second strategy module (Phase 2 of the regime-router refactor). Lives in the STRATEGY MODULES section between Trend Pullback and the router. `grp_orb` inputs. **`orbEnabled` defaults to `true`**, so on a chart with the RTH filter on it is live out of the box — disable it to get pre-Phase-2 behavior.
+> **Light build status: INERT.** `orbEnabled` is a constant `false` (not an input). The module code below, its dashboard row (`if orbEnabled`), and its plots (`orbShowLevels = false`) all remain in the file and compile, but nothing activates. The 7 former ORB inputs are kept as constants so those references resolve. Re-enabling means turning the constant back into an input. The description below documents behaviour *if re-enabled*.
+
+Second strategy module (Phase 2 of the regime-router refactor). Lives in the STRATEGY MODULES section between Trend Pullback and the router.
 
 **State (`var`, reset on `session_just_opened`):** `orb_open_time` (epoch ms of the RTH open bar — the session anchor), `orb_high` / `orb_low`, `orb_locked`, `orb_done` (one breakout per session).
 
@@ -183,35 +181,15 @@ Second strategy module (Phase 2 of the regime-router refactor). Lives in the STR
 
 ## VWAP Fade Module
 
-Third strategy module (Phase 3). **Counter-trend** mean reversion — the first module with a direction stance opposite to Trend Pullback. `grp_fade` inputs. **`fadeEnabled` defaults to `false`** — opt in deliberately.
-
-**Idea:** price stretches past `VWAP ± fadeBandATR × ATR(14)`, stalls, then closes back inside the band on a reversal bar → fade the excursion toward VWAP.
-
-**State (`var`, reset on `session_just_opened`):** `fade_armed_up`/`fade_armed_dn` (in an above/below-band excursion), `fade_peak_up`/`fade_peak_dn` (max `|price − vwap|` reached during it), `fade_fired_up`/`fade_fired_dn` (fade already taken for this excursion).
-
-**Excursion tracking (confirmed bars only):** `high > up_edge` arms the up side and grows `fade_peak_up`; `close < vwap` is the **deep reset** — clears arm + peak + fired so a fresh stretch is needed for another fade. Mirror for the down side (`low < dn_edge`, `close > vwap`). Because the deep reset keys on the VWAP cross, not the session boundary, the module also works with `useSessionFilter` off (VWAP itself still re-anchors daily).
-
-**Eligibility gate (`fade_regime_ok`):** `regime ∈ {RANGE, EXHAUSTED}` **and** `adx < 1.5 × adx_min`. This is where `regime` stops being purely descriptive. Never fades `TREND` / `BREAKOUT` / `SQUEEZE`.
-
-**Trigger** (`fade_short_trig` / `fade_long_trig`), all required, all confirmed-bar:
-- armed on that side and not yet fired for this excursion
-- `close` back inside the band edge
-- reversal bar: `close < open` (short) / `close > open` (long)
-- momentum rolling over: `rsiVal < rsiVal[1]` (short) / `rsiVal > rsiVal[1]` (long)
-
-Plus `fade_calm` (`rel_vol < fadeMaxRvol`, 0 disables — a volume thrust is a breakout, not exhaustion) and `fade_quality >= fadeMinQuality`. `fade_fired_up/dn` is set on the firing bar.
-
-**`fade_quality` (0–100)** — additive, `math.min(…,100)`: excursion size (`fade_peak/ATR`; 35 for 1.5–4.0, 20 for 1.0–6.0, else 8) + reversal-bar strength (25 if the close is in the reverting third of the bar's range, else 10) + volume calm (`rel_vol` <1.0 → 20, <1.5 → 10) + regime (`EXHAUSTED` → 20, `RANGE` → 12).
-
-**Router:** `if fade_long or fade_short` sets `active_strategy := "VWAP Fade"` and `strat_*` to the `fade_*` values, above Trend Pullback but below ORB. Downstream (dispatch alternation, P&L, win-rate, `🔄FADE` label tag, alerts) is unchanged and module-agnostic.
-
-**Not modelled yet:** a VWAP-target exit (P&L exits are still global Fixed-%), a re-arm short of the full VWAP round-trip, and any user control to relax the regime gate.
+> **Removed in the light build.** The module block, its router branch, its two band plots, its dashboard row, and its inputs (`grp_fade`) are deleted from `SLT.pine`. `regime` is now purely descriptive (Fade was its only non-descriptive consumer). `mod_results` still has 3 slots and `strat_id("VWAP Fade") → 2` still maps, but nothing ever writes slot 2 — left in place to avoid renumbering the ORB slot. The dispatch/P&L/win-rate machinery was module-agnostic, so removing Fade required no changes there. History for a re-add: it was a counter-trend mean-reversion module gated on `regime ∈ {RANGE, EXHAUSTED} and adx < 1.5×adx_min`, sitting above Trend Pullback in the router.
 
 ---
 
 ## Profile Parameters Table
 
 All threshold variables are assigned once per bar based on `syminfo.type`. The `switch` expression maps every possible `syminfo.type` value: `"stock"` → STOCK, `"fund"` → FUND, `"futures"` → FUTURES, `"crypto"` → CRYPTO, and **everything else** (index, forex, unknown) → MARKET via the switch default. The MARKET profile is the true catch-all; there is no separate DEFAULT profile in the code.
+
+**Scoring / gate thresholds:**
 
 | Profile | `vwap_h_limit` | `vwap_e_limit` | `adx_min` | `rvol_gate` | `ext_scale` | `fuel_max` | `ema_max` | `vwap_max` | `sma_len` |
 |---------|----------------|----------------|-----------|-------------|-------------|------------|-----------|------------|-----------|
@@ -221,15 +199,49 @@ All threshold variables are assigned once per bar based on `syminfo.type`. The `
 | FUTURES ⚡ | 1.5% | 3.0% | 15 | 0.6× | 2.5 ATR | 90% | 30 | 15 | 70 |
 | CRYPTO 🪙 | 3.0% | 6.0% | 28 | 0.6× | 4.0 ATR | 95% | 25 | 20 | 120 |
 
+**Auto-tune fields** (light build — set in the same `if/else` chain, resolved right after it):
+
+| Profile | `ema_slow_auto` | `sma_buf_auto` | `min_score_auto` | `rth_auto` |
+|---------|-----------------|----------------|------------------|------------|
+| MARKET INDEX 🏦 | 30 | 0.20 | 55 | `true` |
+| ETF / FUND 📊 | 30 | 0.20 | 50 | `true` |
+| STOCK 🚀 | 20 | 0.25 | 50 | `true` |
+| FUTURES ⚡ | 30 | 0.30 | 45 | `false` |
+| CRYPTO 🪙 | 20 | 0.35 | 55 | `false` |
+
+`emaSlowPeriod = ema_slow_auto`; `smaBufferATR = sma_buf_auto`; `minScoreBuy = minScoreSell = min_score_auto`; `useSessionFilter = rth_auto`. `maxBarsFromFlip` is not a profile field — it's `anchorMode == "SMA" ? 0 : 10`, applied in the resolution block.
+
+---
+
+## Auto-Tune (light build)
+
+The parent script exposed ~30 inputs. The light build keeps 3 (Anchor, Score Stars, P&L) and derives or pins the rest.
+
+**Derived from the asset profile + anchor** — resolved in the `AUTO-TUNE RESOLUTION` block immediately after the profile `if/else` chain:
+
+| Effective global | Source | Notes |
+|---|---|---|
+| `emaSlowPeriod` | `ema_slow_auto` (profile) | 20 for fast movers (STOCK/CRYPTO), 30 for grinders. Pins to `ema20` for Component 1 regardless. |
+| `smaBufferATR` | `sma_buf_auto` (profile) | Wider latch band on choppier / higher-vol profiles. |
+| `minScoreBuy` / `minScoreSell` | `min_score_auto` (profile), single value both sides | 45 (FUTURES) … 55 (MARKET/CRYPTO). The [Component 1 normalization](#scoring-components) is what lets one value serve both anchors. |
+| `useSessionFilter` | `rth_auto` (profile) | `false` for FUTURES + CRYPTO — the RTH filter would black out most of a 24h instrument's day. |
+| `maxBarsFromFlip` | `anchorMode == "SMA" ? 0 : 10` | EMA9/slow crosses lag the turn → cap entry distance; the SMA latch already fires on the flip bar, so no cap. **This is the one parameter that changes when you switch anchors** — keep it in mind for cross-anchor win-rate comparison. |
+
+**Pinned constants** (`FIXED BEHAVIOUR` block, top of file): `showLabels=true`, `sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, `enableSuccessRate=true`, `maxSignalsToTrack=50`, `showSignalPnL=true`, `showDash=true`, `extDash=false`, `showCircles=true`, `showBg=true`.
+
+**Retired modules:** `orbEnabled=false` + 7 ORB tuning constants kept so the (still-present) ORB module, its dashboard row, and its plots compile without ever activating. The VWAP Fade module, its router branch, its plots, its dashboard row, and its inputs are deleted; `mod_results` slot 2 and the `strat_id("VWAP Fade")→2` mapping are left as harmless vestiges to avoid renumbering.
+
+**To hand-tune:** edit the profile `if/else` chain (or the resolution block for `maxBarsFromFlip`). There is no in-panel override — re-adding an input is a one-line change if experimentation demands it.
+
 ---
 
 ## Key Design Decisions
 
 **Profile-adaptive scoring:** `ema_max` and `vwap_max` vary by asset type (e.g., FUTURES gets `ema_max=30`, `vwap_max=15`), so the raw 100-point maximum is assembled differently per profile. All profiles sum to 105 before the cap. When modifying component weights, check all five profiles.
 
-**Strategy router (phased refactor, currently Phase 4):** Signal generation is structured as *regime classification → strategy modules → router → dispatch*. Three modules exist: **Trend Pullback** (`tp_*`, the anchor + confluence logic verbatim), **ORB** (`orb_*`, see [ORB Module](#orb-module)), **VWAP Fade** (`fade_*`, see [VWAP Fade Module](#vwap-fade-module)). The router (`active_strategy`/`strat_long`/`strat_short`/`strat_quality`) resolves last-write-wins Trend Pullback → VWAP Fade → ORB. `regime` gates the VWAP Fade module's eligibility (its first non-descriptive use). Every downstream consumer (P&L, win-rate, labels, alerts, dashboard) fires off the dispatched `signal_buy`/`signal_sell` / the `strat_*` surface, so modules are added without touching them. Win-rate is now tracked **per module** as well as overall (`mod_results`, keyed by the module that opened each entry). **When adding a module:** expose `<name>_long`/`<name>_short`/`<name>_quality`, keep it fully self-gated, register it in the router (opposite-stance modules go *above* Trend Pullback and must carry a regime gate), let dispatch apply alternation, and add a `strat_id()` slot + a dashboard row for its win rate. Still open: `regime` as an explicit eligibility matrix for every module; HOD/LOD-break and prior-day-level modules; per-module P&L targets.
+**Strategy router (light build):** Signal generation is still structured as *regime classification → strategy modules → router → dispatch*, but only **Trend Pullback** (`tp_*`, the anchor + confluence logic) is live. **ORB** (`orb_*`) code is present but inert (`orbEnabled = false`); **VWAP Fade** is deleted. The router (`active_strategy`/`strat_long`/`strat_short`/`strat_quality`) resolves last-write-wins Trend Pullback → ORB, so with ORB off it always yields Trend Pullback and `regime` is purely descriptive. Every downstream consumer (P&L, win-rate, labels, alerts, dashboard) still fires off the dispatched `signal_buy`/`signal_sell` / the `strat_*` surface, so the module machinery is intact. Per-module win-rate (`mod_results`) still exists; only slot 0 (Trend Pull) ever fills. **When re-adding a module:** expose `<name>_long`/`<name>_short`/`<name>_quality`, keep it fully self-gated, register it in the router (opposite-stance modules go *above* Trend Pullback and must carry a regime gate), let dispatch apply alternation, and wire a `strat_id()` slot + dashboard row. The `sigTime="Trend"` path in Trend Pullback is also dead code (pinned to `"Score"`).
 
-**Dual-anchor unification:** After anchor selection, all downstream logic uses `is_bull`, `is_bear`, `trendUp`, `trendDown` — never `ema_*` or `sma_*` directly. The scoring engine, all 4 risk gates, signal generation, both P&L systems, win-rate tracking, and `maxBarsFromFlip` are all anchor-agnostic through this interface. The EMA slow period (`emaSlowPeriod` = 20 or 30, default 30) affects cross detection but NOT Component 1 scoring, which always uses `ema20`. Score mode and Trend mode are both gated through the same `is_bull`/`is_bear` flags.
+**Dual-anchor unification:** After anchor selection, all downstream logic uses `is_bull`, `is_bear`, `trendUp`, `trendDown` — never `ema_*` or `sma_*` directly. The scoring engine, all 4 risk gates, signal generation, and both P&L systems are anchor-agnostic through this interface. `maxBarsFromFlip` is the deliberate exception: it resolves to `anchorMode == "SMA" ? 0 : 10`. The EMA slow period (`emaSlowPeriod = ema_slow_auto`, 20 or 30 by profile) affects cross detection but NOT Component 1 scoring, which is decoupled from the anchor entirely (`c1_bull`/`c1_bear` off `ema9`/`ema20`). Only the Score-mode signal branch is live (`sigTime` pinned to `"Score"`); the Trend-mode branch is retained but unreachable.
 
 The anchor selectors are **binary ternary chains** (`anchorMode == "SMA" ? … : …`), every one ending in the EMA Cross branch — so any `anchorMode` value other than `"SMA"` resolves to EMA Cross behavior rather than erroring. A new anchor would have to be added to all four selectors plus `anchor_line_price`, `anchor_short`, and `anchor_ready` explicitly. Only the *drawing* sites (`plot`, `plotshape`, `fill`, dashboard `anchor_display`) use explicit `anchorMode == "..."` equality, so an unhandled mode draws no anchor line at all — which is the symptom to look for.
 
@@ -241,9 +253,9 @@ The anchor selectors are **binary ternary chains** (`anchorMode == "SMA" ? … :
 
 **Signal blocking (strict alternation):** `b_fired`/`s_fired` block a same-direction signal from firing again — in both "Trend" and "Score" signal-timing modes — until the opposite signal actually fires, no matter how many trend flips happen in between. E.g. BUY fires, trend flips bear but SELL's score/quality filter never clears, trend flips bull again → BUY stays blocked. The flags do **not** reset on a trend direction change by itself (`is_bull` vs `is_bull[1]`); they only clear when `signal_buy`/`signal_sell` actually fires (`b_fired := true, s_fired := false` and vice versa) or at RTH session open (`useSessionFilter`-gated, so 24h instruments with the filter off never get a daily reset). Live P&L tracking (`pnl_entry_price`, dashboard P&L, signal-to-signal P&L history) does not consult these flags and keeps accumulating across the held direction regardless.
 
-**RTH filter on 24h instruments:** `time(timeframe.period, "0930-1600:23456")` always evaluates against ET hours regardless of instrument type. The filter does NOT auto-disable for CRYPTO or 24h FUTURES. If `useSessionFilter = true` on those instruments, signals will be blocked outside 9:30–4:00 ET Mon–Fri with no warning. Recommended: disable `useSessionFilter` for crypto and around-the-clock futures contracts.
+**RTH filter on 24h instruments:** `time(timeframe.period, "0930-1600:23456")` always evaluates against ET hours regardless of instrument type. In the light build `useSessionFilter = rth_auto`, which the profile block sets to `false` for FUTURES and CRYPTO — so the 24h blackout hazard is handled automatically. The MARKET profile (index / forex / unknown) still resolves `rth_auto = true`; a 24h forex or index-future symbol that lands in MARKET would get the RTH blackout. If that comes up, set `rth_auto := false` in the MARKET branch or add a dedicated profile.
 
-**Entry freshness constraint:** `maxBarsFromFlip` (0-50, default 0 = disabled) constrains Score-mode entries to fire only within N bars of the most recent anchor flip, via `entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip` AND'd into the Score-mode branch only. `bars_since_flip` (`var int`) resets to 0 on the flip bar itself and increments every bar after, tracked alongside the existing `trend_start_price` reset so both stay in sync with the same flip event. Trend mode is deliberately unaffected — it already fires directly on the flip bar by construction, so there's nothing to constrain. This is independent of (and complements) the Stretch gate, which only actually penalizes extension when `gateOn = true`; `maxBarsFromFlip` works regardless of gate mode. Calibrate using the Extended Metrics "Bars From Flip" row.
+**Entry freshness constraint:** `maxBarsFromFlip` is auto-set from the anchor: `anchorMode == "SMA" ? 0 : 10` (SMA latches on the flip bar so it needs no cap; EMA9/slow crosses lag the turn so entries are capped at 10 bars past the flip). It constrains Score-mode entries via `entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip`. `bars_since_flip` (`var int`) resets to 0 on the flip bar and increments after, in sync with the `trend_start_price` reset. This is independent of (and complements) the Stretch gate. Calibrate a profile-specific value by editing the resolution-block ternary; observe via the Extended Metrics "Bars From Flip" row.
 
 **Two P&L tracking systems (independent):**
 - *Live dashboard P&L* — tracks position from `pnl_entry_price`, reset on every new `signal_buy`/`signal_sell`. Since strict alternation (see Signal Blocking above) means there's only ever one signal per held direction, entry always corresponds to the signal that opened the current position — a separate "First Signal" reset-on-direction-change mode is no longer meaningful and was removed.
@@ -257,7 +269,7 @@ The anchor selectors are **binary ternary chains** (`anchorMode == "SMA" ? … :
 
 **Win-rate tracking — every signal, scored on close:** `buy_results`/`sell_results` count every BUY/SELL signal exactly once, not just ones that hit a PROFIT/LOSS target. An entry's outcome isn't known until it's closed by the next opposite-direction signal (per strict alternation, there's exactly one open position per direction at a time), so `buy_won_this_entry`/`sell_won_this_entry` (`var bool`) accumulate whether `target_reached` fired at any point during the entry; when the opposite signal fires, that flag is pushed into the results array (`true` = won, `false` = everything else — a `stop_reached` exit, or the position simply being reversed with no target ever hit) and then reset for the new entry. `buy_entry_open`/`sell_entry_open` (`var bool`) guard against scoring before any entry has actually opened. Each results array is an independent rolling `array<bool>` capped at `maxSignalsToTrack` via FIFO (`array.shift` on overflow). `calc_win_rate(arr, enabled) => [wins, total, rate]` computes stats for every array from one shared read-only function. The currently-open entry is never counted until it closes — the win rate reflects only resolved signals.
 
-**Per-module win-rate (Phase 4):** every place that pushes into `buy_results`/`sell_results` — the two closes in *UPDATE SUCCESS RATE TRACKING* and the session-open carry-over close — also calls `record_module(mod_results, strat_id(<dir>_entry_strategy), is_buy, won, cap)`. `mod_results` is a `var array<ModResults>` (UDT wrapping `array<bool> buys` / `array<bool> sells`, because Pine arrays can't nest — same trick as `TodSession`), populated once with 3 slots. `strat_id()` maps the strategy name to `0` Trend Pullback / `1` ORB / `2` VWAP Fade (anything unknown → 0). `<dir>_entry_strategy` (`var string`) is stamped from `active_strategy` at the moment the entry opens, so the outcome is credited to the module that *entered*, not whatever is active when it closes. `record_module` mutates the UDT's inner array in place (reference type reachable through the `store` parameter — the standard Pine workaround for "can't reassign a global from a function"). The 3 dashboard rows are gated Trend-Pull-always / ORB-if-`orbEnabled` / Fade-if-`fadeEnabled` and each carries an `if row < DASHBOARD_MAX_ROWS` guard.
+**Per-module win-rate (Phase 4):** every place that pushes into `buy_results`/`sell_results` — the two closes in *UPDATE SUCCESS RATE TRACKING* and the session-open carry-over close — also calls `record_module(mod_results, strat_id(<dir>_entry_strategy), is_buy, won, cap)`. `mod_results` is a `var array<ModResults>` (UDT wrapping `array<bool> buys` / `array<bool> sells`, because Pine arrays can't nest — same trick as `TodSession`), populated once with 3 slots. `strat_id()` still maps `0` Trend Pullback / `1` ORB / `2` VWAP Fade (anything unknown → 0) — the ORB and Fade mappings are vestigial in the light build. `<dir>_entry_strategy` (`var string`) is stamped from `active_strategy` at the moment the entry opens. `record_module` mutates the UDT's inner array in place (reference type reachable through the `store` parameter). The per-module dashboard rows are gated Trend-Pull-always / ORB-if-`orbEnabled` (never, `orbEnabled` is a constant `false`); the Fade row was removed. In practice only slot 0 fills.
 
 **Dashboard row budget:** `DASHBOARD_MAX_ROWS = 36` (rows 0–35), bumped 28→30 (Phase 2, ORB row) →32 (Phase 3, Fade row) →36 (Phase 4, up to 3 per-module win-rate rows). All the added rows are toggle-gated and the per-module loop also self-guards with `if row < DASHBOARD_MAX_ROWS`, so a minimal config still uses the original count. The gate detail loop is the last section; it has an explicit `if row >= DASHBOARD_MAX_ROWS: break` guard because it is the only variable-length section (all other rows are fixed-count by design). Success Rate Tracking occupies 3 fixed rows (separator + BUY Win Rate + SELL Win Rate) plus 1–3 per-module rows whenever enabled, regardless of Extended Metrics.
 
@@ -291,34 +303,30 @@ Common failure modes when editing this script:
 No test runner exists. After any edit, verify manually in this order:
 
 1. **Paste into Pine Editor → zero compilation errors** before proceeding
-2. **Load NVDA 2-min chart** → confirm dashboard appears at bottom-right
-3. **Score ≤ 100** on dashboard at all times (raw_score is capped, but confirm no overflow)
-4. **Signal alternation:** let a BUY fire → confirm next BUY is blocked until a SELL fires, including across multiple trend flips where SELL's quality filter never clears (BUY → flip bear, no SELL → flip bull again → still no second BUY)
-5. **No double-count on same-bar PROFIT + new signal:** when a PROFIT fires on the same bar as a new signal, confirm success rate increments by 1, not 2
-6. **Gate enforcement:** toggle `Enable Risk Gates` ON → confirm score drops when gates are active; toggle OFF → score unchanged but warnings visible
-7. **SMA mode:** anchor defaults to SMA → confirm the SMA line appears (not EMA9) with its grey ATR buffer band, flip circles appear where the latched state changes; switch to EMA Cross → confirm EMA9 line appears instead, flip circles at crossover bars
-8. **Dashboard row count:** with Success Rate Tracking + all 4 gates active + Extended Metrics ON + ORB + VWAP Fade modules enabled (so all 3 per-module win-rate rows render), confirm no runtime error (row overflow guard working; `DASHBOARD_MAX_ROWS = 36`)
-9. **RVOL mode:** toggle `Relative Volume Mode` between `Rolling 20-bar` and `Time-of-Day` on the same chart → confirm the Volume row's RVOL multiplier and mode label (`TOD` / `20-bar`) both change, and that a chart with less than `RVOL Lookback Sessions` of history shows `20-bar*` (fallback) instead of `na` or a stale value
-10. **P&L Target:** with `Enable P&L Exit Signals` on, confirm PROFIT/LOSS fires at exactly `±P&L Target (%)` from `pnl_entry_price` and labels show the static target text (e.g. `PROFIT +1.0%`)
-11. **Win rate:** with `Enable Success Rate Tracking` on, confirm the dashboard shows `BUY Win Rate`/`SELL Win Rate`; let a BUY hit PROFIT then get closed by the next SELL → confirm it counts as a win; let a BUY hit LOSS then get closed by the next SELL → confirm it counts as a loss; let a BUY get closed by the next SELL without ever hitting PROFIT or LOSS → confirm it also counts as a loss; confirm the currently open (not-yet-closed) signal is never counted
-12. **Stale dashboard rows:** let a gate go active (gate-detail rows appear), then wait for it to clear → confirm the Gate Details rows disappear entirely rather than freezing on the last warning text
-13. **`enablePnL` independence:** turn `Enable P&L Exit Signals` OFF with Success Rate Tracking ON → confirm PROFIT/LOSS labels and alerts stop, but BUY/SELL win rates keep resolving normally (they must NOT collapse to 0%)
-14. **Session-open flatten:** with the RTH filter ON, hold a position into the close → confirm at the next 9:30 open the dashboard P&L reads `—` and no PROFIT/LOSS label fires off the overnight gap
-15. **Anchor row:** with anchor = EMA Cross → confirm the first dashboard row reads `Trend (EMA9)` with the EMA9 price; switch to SMA → `Trend (SMA)` with the SMA price, and the Signal Anchor row reads e.g. `SMA (70) AUTO ±0.25A`
-16. **SMA anchor:** switch anchor to SMA → confirm the SMA line plots (not EMA9) with a grey buffer band either side, flip circles appear only where the latched state changes, and the dashboard Trend row reads `Trend (SMA)`; set `SMA Buffer = 0` → confirm flips become noticeably more frequent (raw cross); set `SMA Buffer = 1.0` → confirm flips become rare and price must clear the band before the line changes color; confirm no flip ever fires on a bar where price sits inside the band
-17. **Entry freshness:** in Score mode, set `Max Bars From Flip = 5` → confirm no BUY/SELL fires on bar 6+ after a flip (watch the "Bars From Flip" Extended Metrics row to confirm the count itself resets to 0 on each flip bar); confirm Trend mode is unaffected by the same setting; confirm worst case (Success Rate + Extended Metrics + all 4 gates + ORB + Fade on) still shows no dashboard row overflow with `DASHBOARD_MAX_ROWS = 36`
-18. **Strategy router — no behavior change with all extra modules off:** with `orbEnabled = false` and `fadeEnabled = false`, the **Strategy** row reads `Trend Pullback · <regime>`, no ORB/Fade rows render, and signals fire on exactly the same bars as a Phase-1 build (spot-check BUY/SELL bars in both `sigTime` modes).
-19. **ORB range + lock:** on an RTH chart (NVDA 2-min, filter ON), at the open the ORB row reads `forming …`; at `Opening Range (minutes)` past the open it flips to `armed H/L Q<n>` and the orange ORB High/Low lines appear and stop moving; confirm the lines break (don't connect) into the next session and a fresh range forms.
-20. **ORB breakout fires once:** let price close beyond the locked high by `Breakout Buffer (ATR)` with `rel_vol ≥ Min RVOL` → confirm a `BUY … ⚡ORB` label fires, the Strategy row shows `ORB · …` on that bar, and the ORB row flips to `✅ fired this session`; confirm no second ORB entry that session even on a bigger break; confirm strict alternation still holds (next same-direction signal, ORB or Trend Pullback, blocked until a SELL).
-21. **ORB needs RTH filter:** turn `RTH Session Filter` OFF with ORB enabled → confirm the ORB row reads `⚠️ needs RTH filter`, no ORB label ever fires, and Trend Pullback signals are unchanged.
-22. **ORB off = pre-Phase-2:** set `Enable ORB Module` OFF → confirm no ORB row, no ORB lines, and identical signals to a Phase-1 build.
-23. **VWAP Fade arm/reset:** enable the module on a ranging chart → teal band edges plot at `VWAP ± Fade Band × ATR`; when price pushes past an edge the Fade row reads `stretched ↑/↓ <n> ATR`; when price closes back through VWAP the row returns to `watching …` (arm cleared).
-24. **VWAP Fade fires counter-trend, once per excursion:** in a `RANGE`/`EXHAUSTED` regime, after an up-excursion let a bearish bar close back inside the upper band with RSI ticking down → confirm a `SELL … 🔄FADE` label fires with the Strategy row showing `VWAP Fade · …`; confirm no second fade off the same excursion until price has reverted through VWAP and stretched again; confirm nothing fires while `regime` is `TREND`/`BREAKOUT` (row shows `idle (<regime>)`).
-25. **VWAP Fade off = unchanged:** `Enable VWAP Fade Module` OFF (the default) → no Fade row, no bands, signals identical to a two-module (Phase 2) build.
-26. **Per-module win rate:** with all 3 modules enabled + Success Rate Tracking on, let an ORB entry and a Trend Pullback entry each resolve → confirm the `ORB` and `Trend Pull` dashboard rows each move independently and their combined counts add up to the overall BUY/SELL Win Rate totals; a module with no resolved signals reads `B — S —`; disabling ORB/Fade removes only that module's row.
+2. **Settings panel shows exactly 3 controls:** Signal Anchor, Score Stars, and the P&L Exit group (Enable + Target %). No SMA/Signal-timing/RVOL/ORB/Fade/Success/Visuals groups.
+3. **Load NVDA 2-min chart** → dashboard appears bottom-right; the **Signal Anchor** row reads `SMA (70) auto ±0.25A` (NVDA = STOCK profile), the **Strategy** row reads `Trend Pullback · <regime>`.
+4. **Score ≤ 100** on the dashboard at all times; confirm the 105-max component sum never overflows the clamp.
+5. **Signal alternation:** let a BUY fire → next BUY blocked until a SELL fires, across multiple trend flips where SELL's quality filter never clears.
+6. **No double-count on same-bar PROFIT + new signal:** success rate increments by 1, not 2.
+7. **Gates always enforced:** `gateOn` is a pinned constant `true` — confirm the dashboard shows `Gates` (not `Risks`) and that an active gate drops `final_score`.
+8. **Anchor swap:** default SMA → SMA line + grey buffer band, flip circles at latched-state changes, Trend row `Trend (SMA)`, Signal Anchor row `… auto ±<buf>A`. Switch to EMA Cross → EMA9 line instead, flip circles at crossover bars, Signal Anchor row `EMA Cross (9/<20|30>) auto`, and `Max Bars From Flip` behaviour changes (see 12).
+9. **Dashboard row budget:** worst case (Extended Metrics ON, all 4 gates active) → no runtime row-overflow error; `DASHBOARD_MAX_ROWS = 36`. (ORB/Fade rows never render.)
+10. **RVOL fallback:** `rvolMode` is pinned to Time-of-Day → Volume row shows `TOD` on a chart with ≥ `rvolLookbackDays` (10) sessions of history, and `20-bar*` (auto fallback) on a short chart — never `na` or a stale value.
+11. **P&L Target:** with `enablePnL` on, PROFIT/LOSS fires at exactly `±pnlTarget %` from `pnl_entry_price`; labels show the static target text (e.g. `PROFIT +1.0%`).
+12. **Auto entry-freshness by anchor:** in **EMA Cross** mode, confirm no BUY/SELL fires more than 10 bars after a flip (watch the "Bars From Flip" Extended Metrics row — count resets to 0 on each flip bar); in **SMA** mode the "Bars From Flip" row reads `(unlimited)` and entries can fire at any distance. `sigTime` is pinned to Score, so there is no Trend-mode comparison.
+13. **Win rate:** dashboard shows `BUY Win Rate` / `SELL Win Rate`; a BUY that hits PROFIT then is closed by the next SELL counts as a win; hits LOSS → loss; closed with neither → loss; the currently open signal is never counted. The `Trend Pull` per-module row tracks in lock-step with the overall totals (it's the only live module).
+14. **`enablePnL` independence:** turn P&L Exit OFF → PROFIT/LOSS labels + alerts stop, but BUY/SELL win rates keep resolving normally (must NOT collapse to 0%).
+15. **Stale dashboard rows:** let a gate go active (gate-detail rows appear), then clear → the Gate Details rows disappear entirely, not freeze on stale text.
+16. **Session-open flatten:** on a STOCK/FUND/MARKET symbol (`rth_auto = true`), hold a position into the close → at the next 9:30 open the dashboard P&L reads `—` and no PROFIT/LOSS fires off the overnight gap.
+17. **RTH auto-off for 24h profiles:** load a CRYPTO or FUTURES symbol → confirm `useSessionFilter` resolves `false` (signals fire outside 9:30–16:00 ET; no session-open flatten). Load a STOCK → resolves `true`.
+18. **Profile auto-tune resolves:** on a STOCK chart the Signal Anchor row shows buffer `±0.25A` and (EMA mode) `9/20`; on a MARKET-INDEX chart `±0.20A` and `9/30`; on CRYPTO `±0.35A` and `9/20`. Min-score base moves 45↔55 by profile (check the `⭐`/`⚠️` threshold in Extended Metrics).
+19. **ORB fully inert:** no ORB row, no orange ORB lines, no `⚡ORB` label ever; `active_strategy` is always `Trend Pullback`. Signals identical to a build with the ORB module physically deleted.
+20. **Component 1 anchor-independence:** Component 1's bull/bear branch is chosen by `c1_bull`/`c1_bear` (`ema9` vs `ema20`), never `is_bull`/`is_bear`, and pins to `ema20` regardless of the profile's `ema_slow_auto`. In SMA mode on a strong uptrend bar where price is extended well above `ema20` → confirm Component 1 is *not* stuck at `✅ FULL CASCADE` (it drops to `PARTIAL`/`WEAK`), and on a bar where the EMAs roll over under an SMA-bull anchor confirm Component 1 reads `🔴 COUNTER-TREND` while the Trend row still reads `BULLISH 🔼` (intended divergence, not a bug). Confirm `raw_score ≤ 100` and the 105-max invariant hold in both anchor modes.
 
 ---
 
 ## Version
 
-The script file is `SLT.pine`. It was forked from **SuperLazyTrade V3** with the SuperTrend signal anchor removed entirely: the input option, the SuperTrend Engine settings group (`atrMode` / `atrLen_manual` / `factor_manual`), the adaptive ATR/factor selection block, the `ta.supertrend` call, the `st_*` anchor, its plots/fills/flip circles, and the dashboard branch. Anchor selection is now binary — SMA (default) or EMA Cross. The on-chart `indicator()` title is `SLT V1` (from `VERSION = "V1"`). No changelog history is tracked in the file — treat the current source as the reference behavior going forward.
+The script file is `SLT.pine`. It was forked from **SuperLazyTrade V3** with the SuperTrend signal anchor removed entirely (input option, SuperTrend Engine settings group, adaptive ATR/factor block, `ta.supertrend` call, `st_*` anchor, its plots/fills/circles, dashboard branch). Anchor selection is binary — SMA (default) or EMA Cross.
+
+**Light-build simplification (current):** the input surface is reduced to 3 controls (Signal Anchor, Score Stars, P&L Exit). Former inputs are auto-tuned from the asset profile + anchor (`ema_slow_auto` / `sma_buf_auto` / `min_score_auto` / `rth_auto` → `emaSlowPeriod` / `smaBufferATR` / `minScore*` / `useSessionFilter`, plus `maxBarsFromFlip` from the anchor) or pinned as constants (`sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, SMA MANUAL mode dropped, all dashboard/success toggles). The **VWAP Fade** module is deleted; the **ORB** module is retained but inert (`orbEnabled=false` constant). Component 1 (EMA Cascade) was also decoupled from the anchor (`c1_bull`/`c1_bear` off `ema9`/`ema20`) so `raw_score` is comparable across anchors. The on-chart `indicator()` title is `SLT V1` (from `VERSION = "V1"`). No changelog history is tracked in the file — treat the current source as the reference behavior going forward.
