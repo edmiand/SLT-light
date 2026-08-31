@@ -665,12 +665,22 @@ string t_status = ""
 bool bull_cascade = ema9 > ema20 and ema20 > ema50
 bool bear_cascade = ema9 < ema20 and ema20 < ema50
 
+// Direction reference for Component 1 is the EMA relationship, NOT the selected
+// anchor. In SMA mode, is_bull (price vs a slow SMA) strongly implies the full
+// cascade passes, inflating this component on trend continuation and making
+// raw_score non-comparable across anchor modes. Keying off ema9 vs ema20 makes
+// Component 1 compute identically in EMA Cross and SMA mode (and invariant to
+// emaSlowPeriod, matching the existing "Component 1 always uses ema20" rule).
+// >= on the bull side avoids a silent t_pts = 0 on exact equality.
+bool c1_bull = ema9 >= ema20
+bool c1_bear = ema9 < ema20
+
 // Proportional scoring: 100% / 60% / 30% / 0% of ema_max
 int ema_full    = ema_max
 int ema_partial = math.round(ema_max * 0.60)
 int ema_weak    = math.round(ema_max * 0.30)
 
-if is_bull
+if c1_bull
     if bull_cascade and close > ema9
         t_pts := ema_full
         t_status := "✅ FULL CASCADE"
@@ -683,7 +693,7 @@ if is_bull
     else
         t_pts := 0
         t_status := "🔴 COUNTER-TREND"
-else if is_bear
+else if c1_bear
     if bear_cascade and close < ema9
         t_pts := ema_full
         t_status := "✅ FULL CASCADE"

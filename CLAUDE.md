@@ -71,6 +71,7 @@ All 5 components sum to `raw_score`, capped at 100. Component maxes vary by prof
 - Weak (30%): close beyond ema50 only
 - Zero: counter-trend
 - Always uses `ema20` (not `emaSlow`) — slow period choice only affects anchor, not scoring
+- **Direction is anchor-independent:** the bull/bear branch is chosen by `c1_bull = ema9 >= ema20` / `c1_bear = ema9 < ema20`, *not* by `is_bull`/`is_bear`. This makes Component 1 compute identically in EMA Cross and SMA mode — in SMA mode `is_bull` (price vs a slow SMA) all but guarantees the full cascade, which used to inflate this component on trend continuation and made `raw_score` non-comparable across anchor modes. Consequence: in SMA mode the dashboard Component 1 status can read `COUNTER-TREND` while the anchor/trend row reads `BULLISH` (EMA structure and the SMA anchor genuinely disagree).
 
 **Component 2 — VWAP Value (profile-adaptive):**
 - BOUNCE/REJECTION (full `vwap_max`): within 0.33× `vwap_h_limit` of VWAP, correct side
