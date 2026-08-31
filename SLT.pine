@@ -20,12 +20,12 @@ const int LIQUIDITY_PENALTY = 25
 
 // DASHBOARD
 const string DASH_WIDTH = "                                        "
-// Sized to leave 6 row slots before the break guard for the
-// variable-length gate-details loop below. Bumped 28 -> 30 (Phase 2, optional
-// ORB row) -> 32 (Phase 3, optional VWAP Fade row) -> 36 (Phase 4, up to 3
-// optional per-module win-rate rows). Every extra row renders only when the
-// relevant module / tracking is enabled, so a minimal config sees the
-// original row count.
+// Sized to leave headroom before the break guard for the variable-length
+// gate-details loop below. History: 28 -> 30 -> 32 -> 36 as the router phases
+// added optional ORB / VWAP Fade / per-module win-rate rows. The light build
+// removed VWAP Fade and made ORB inert, so the live worst case is well under
+// 36 (only the Trend Pull per-module row draws); the constant is kept at 36
+// as slack for re-adding a module.
 const int DASHBOARD_MAX_ROWS = 36
 
 //======================================================================
