@@ -280,10 +280,6 @@ bool adx_rising_3 = ta.rising(adx, 3)  // 3-bar: Velocity Override
 bool adx_rising_2 = ta.rising(adx, 2)  // 2-bar: Setup Score ADX component
 
 
-// MACD (12/26/9 standard - for Component 5 momentum alignment)
-// Only the MACD line is scored; signal/histogram are intentionally unused.
-[macdLine, _, _] = ta.macd(close, 12, 26, 9)
-
 // Relative Volume: computed after session-tracking (Time-of-Day RVOL
 // needs is_new_session, which is defined further below) — see rel_vol
 // assignment near the ATR Fuel Gauge section.
@@ -696,67 +692,68 @@ else
 
 a_status += " (ADX: " + str.tostring(adx, "#.#") + ")"
 
-// COMPONENT 5: MOMENTUM CONFLUENCE (20 points) - MACD + RSI + SQUEEZE
-// Sub-component A: MACD Directional Alignment (8 points)
-bool macd_aligned = (is_bull and macdLine > 0) or (is_bear and macdLine < 0)
-int macd_pts = macd_aligned ? 8 : 0
+// COMPONENT 5: MOMENTUM CONFLUENCE (20 points) - RSI + SQUEEZE
+// MACD sub-component removed: MACD-line sign is ~EMA12>EMA26, a near-duplicate
+// of Component 1's EMA cascade, so it added almost no independent signal. Its
+// 8 points were redistributed proportionally (7:5) across the two remaining
+// sub-components — RSI 7->12, Squeeze 5->8 — keeping Component 5 at max 20.
 
-// COMPONENT 5B: RSI REGIME-AWARE MOMENTUM (7 points)
+// Sub-component A: RSI REGIME-AWARE MOMENTUM (12 points)
 int rsi_pts = 0
 bool rsi_rising = ta.rising(rsiVal, 2)
 bool rsi_breakout = rsiVal > 60 and rsi_rising
 
 if is_bull
     if rsi_breakout // High-conviction momentum
-        rsi_pts := 7
+        rsi_pts := 12
     else if rsiVal > 45 and rsiVal <= 60
-        rsi_pts := 5
+        rsi_pts := 8
     else if rsiVal > 60 and not rsi_rising // Stalling at highs (contiguous with the >60/<=60 tiers above)
-        rsi_pts := 2
+        rsi_pts := 3
     else
         rsi_pts := 0
 else if is_bear
     if rsiVal < 45 and not rsi_rising // High-conviction downside
-        rsi_pts := 7
+        rsi_pts := 12
     else if rsiVal < 55 and rsiVal >= 40
-        rsi_pts := 5
+        rsi_pts := 8
     else if rsiVal < 40 and rsi_rising // Stalling at lows (contiguous with the >=40/<40 tiers above)
-        rsi_pts := 2
+        rsi_pts := 3
     else
         rsi_pts := 0
 
-// COMPONENT 5C: SQUEEZE RELEASE MOMENTUM (5 points)
+// Sub-component B: SQUEEZE RELEASE MOMENTUM (8 points)
 // Moved from Gate 5 to always-active scoring
 // Rewards expansion opportunities regardless of Gate ON/OFF setting
 int sqz_pts = 0
 string sqz_status = ""
 
 if sqz_release and rel_vol > 1.5
-    sqz_pts := 5
+    sqz_pts := 8
     sqz_status := "💥 BREAKOUT"
 else if sqz_release
-    sqz_pts := 2
+    sqz_pts := 3
     sqz_status := "⚠️ WEAK BO"
 else
     sqz_pts := 0
     sqz_status := "—"
 
-// Combined Momentum Score (now max 20 points)
-int r_pts = macd_pts + rsi_pts + sqz_pts
+// Combined Momentum Score (max 20 points)
+int r_pts = rsi_pts + sqz_pts
 string r_status = ""
 
-if r_pts >= 18
+if r_pts >= 16
     r_status := "✅ FULL"
-else if r_pts >= 14
+else if r_pts >= 12
     r_status := "✅ STRONG"
 else if r_pts >= 8
     r_status := "⚠️ PARTIAL"
-else if r_pts >= 4
+else if r_pts >= 3
     r_status := "⚠️ WEAK"
 else
     r_status := "🔴 DIVERGING"
 
-r_status += " (MACD: " + (macd_aligned ? "✓" : "✗") + " | RSI: " + str.tostring(rsiVal, "#.#") + " | SQZ: " + sqz_status + ")"
+r_status += " (RSI: " + str.tostring(rsiVal, "#.#") + " | SQZ: " + sqz_status + ")"
 
 
 // CALCULATE RAW SCORE (5 components, max 105 points → capped at 100)
