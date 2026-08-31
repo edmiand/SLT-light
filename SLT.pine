@@ -91,10 +91,6 @@ showDash = input.bool(true, "Show Dashboard", group = grp_vis,
      tooltip = "Bottom-right metrics table.")
 extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
      tooltip = "Adds the per-component point breakdown, win-rate rows and diagnostic rows to the dashboard.")
-showCircles = input.bool(true, "Show Trend Flip Circles", group = grp_vis,
-     tooltip = "Mark each anchor flip bar on the chart.")
-showBg   = input.bool(true, "Show Trend Background", group = grp_vis,
-     tooltip = "Tint the chart background by trend direction.")
 
 //======================================================================
 // FIXED BEHAVIOUR
@@ -109,6 +105,8 @@ int    rvolLookbackDays  = 10
 bool   enableSuccessRate = true
 int    maxSignalsToTrack = 50
 bool   showSignalPnL     = true
+bool   showCircles       = true            // trend-flip circles always on
+bool   showBg            = true            // trend background always on
 
 // ORB strategy module — retired in the light build. Kept inert
 // (orbEnabled = false) so the router / dashboard / plot code that still
@@ -1669,18 +1667,24 @@ if showDash and barstate.islast
              text_size = size.small)
         row += 1
 
-        // Per-module win rate (Phase 4). One indented row per module that can
-        // currently produce signals: Trend Pullback always, ORB when orbEnabled
-        // (retired-but-inert in the light build). Combined BUY+SELL, "—" until
-        // that module has a resolved signal.
+        // Per-module win rate (Phase 4). One row per module that can currently
+        // produce signals: Trend Pullback always, ORB when orbEnabled
+        // (retired-but-inert in the light build). Styled to match the BUY /
+        // SELL Win Rate rows above — white label, value colour-coded by the
+        // module's combined BUY+SELL rate.
         for mi = 0 to 2
             bool mi_show = mi == 0 or (mi == 1 and orbEnabled)
             if mi_show and row < DASHBOARD_MAX_ROWS
                 ModResults mr = array.get(mod_results, mi)
                 string mname = mi == 1 ? "ORB" : mi == 2 ? "VWAP Fade" : "Trend Pull"
+                [mw_b, mt_b, _mr_b] = calc_win_rate(mr.buys, true)
+                [mw_s, mt_s, _mr_s] = calc_win_rate(mr.sells, true)
+                int   mt_all = mt_b + mt_s
+                float mrate_all = mt_all > 0 ? (mw_b + mw_s) / mt_all * 100 : 0.0
+                color m_rate_color = mt_all == 0 ? color.new(color.gray, 40) : mrate_all >= 60 ? color.lime : mrate_all >= 50 ? color.yellow : color.red
                 string mtxt = "B " + fmt_win_rate(mr.buys) + "   S " + fmt_win_rate(mr.sells)
-                table.cell(d, 0, row, "  " + mname, text_color = color.gray, text_halign = text.align_left, text_size = size.small)
-                table.cell(d, 1, row, mtxt, text_color = color.new(color.white, 20), text_size = size.small)
+                table.cell(d, 0, row, mname, text_color = color.white, text_halign = text.align_left, text_size = size.small)
+                table.cell(d, 1, row, mtxt, text_color = m_rate_color, text_size = size.small)
                 row += 1
 
     // Extended Metrics
