@@ -522,22 +522,20 @@ string t_status = ""
 bool bull_cascade = ema9 > ema20 and ema20 > ema50
 bool bear_cascade = ema9 < ema20 and ema20 < ema50
 
-// Direction reference for Component 1 is the EMA relationship, NOT the selected
-// anchor. In SMA mode, is_bull (price vs a slow SMA) strongly implies the full
-// cascade passes, inflating this component on trend continuation and making
-// raw_score non-comparable across anchor modes. Keying off ema9 vs ema20 makes
-// Component 1 compute identically in EMA Cross and SMA mode (and invariant to
-// emaSlowPeriod, matching the existing "Component 1 always uses ema20" rule).
-// >= on the bull side avoids a silent t_pts = 0 on exact equality.
-bool c1_bull = ema9 >= ema20
-bool c1_bear = ema9 < ema20
-
 // Proportional scoring: 100% / 60% / 30% / 0% of ema_max
 int ema_full    = ema_max
 int ema_partial = math.round(ema_max * 0.60)
 int ema_weak    = math.round(ema_max * 0.30)
 
-if c1_bull
+// Direction is the selected anchor (is_bull/is_bear): Component 1 measures
+// how well the EMA cascade *confirms the anchor's direction* — a directional
+// confluence term added to raw_score, which is then tested against a
+// direction-specific threshold. (A brief experiment keying this off ema9 vs
+// ema20 instead made the term non-directional and was reverted: it suppressed
+// with-trend pullback entries and added cascade points to counter-trend
+// signals. SMA-mode raw_score skews slightly higher on continuation as a
+// result — accepted; see CLAUDE.md "SMA Anchor".)
+if is_bull
     if bull_cascade and close > ema9
         t_pts := ema_full
         t_status := "✅ FULL CASCADE"
@@ -550,7 +548,7 @@ if c1_bull
     else
         t_pts := 0
         t_status := "🔴 COUNTER-TREND"
-else if c1_bear
+else if is_bear
     if bear_cascade and close < ema9
         t_pts := ema_full
         t_status := "✅ FULL CASCADE"
@@ -1667,13 +1665,16 @@ if showDash and barstate.islast
              text_size = size.small)
         row += 1
 
-        // Per-module win rate (Phase 4). One row per module that can currently
-        // produce signals: Trend Pullback always, ORB when orbEnabled
-        // (retired-but-inert in the light build). Styled to match the BUY /
-        // SELL Win Rate rows above — white label, value colour-coded by the
+        // Per-module win rate (Phase 4). Only drawn in a MULTI-MODULE build:
+        // with just Trend Pullback live, mod_results[0] restates the BUY/SELL
+        // Win Rate rows above it, so the rows are suppressed. The mod_results /
+        // record_module plumbing keeps running regardless, so the rows return
+        // intact the moment a second module goes live. Rows are styled to match
+        // the BUY / SELL Win Rate rows — white label, value colour-coded by the
         // module's combined BUY+SELL rate.
+        bool multi_module = orbEnabled   // extend when another module is re-added
         for mi = 0 to 2
-            bool mi_show = mi == 0 or (mi == 1 and orbEnabled)
+            bool mi_show = multi_module and (mi == 0 or (mi == 1 and orbEnabled))
             if mi_show and row < DASHBOARD_MAX_ROWS
                 ModResults mr = array.get(mod_results, mi)
                 string mname = mi == 1 ? "ORB" : mi == 2 ? "VWAP Fade" : "Trend Pull"
