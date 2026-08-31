@@ -8,7 +8,7 @@ This is a **Pine Script v6 TradingView indicator** — a single-file intraday mo
 
 SLT keeps two signal anchors: **SMA** (default) and **EMA Cross**. The 5-component scoring engine, the 4 risk gates, both P&L tracking systems, win-rate tracking, and the dashboard are carried over from the parent project.
 
-**Light build — 3 user controls only.** The settings panel exposes exactly: **Signal Anchor** (EMA Cross / SMA), **Score Stars** (`sigQuality`), and **P&L Exit** (`enablePnL` + `pnlTarget`). Every other parameter that was a user input in the parent script is either **auto-tuned** from the asset profile + anchor choice (see [Auto-Tune](#auto-tune-light-build) and the [Profile Parameters Table](#profile-parameters-table)) or **pinned** to its tuned default in a `FIXED BEHAVIOUR` block near the top of the file. The **VWAP Fade** module is removed entirely; the **ORB** module is retired but left inert (`orbEnabled = false` constant) so its router/dashboard/plot code still compiles. To change a tuned value, edit the profile `if/else` chain — not the panel.
+**Light build — minimal input surface.** The settings panel exposes: **Signal Anchor** (EMA Cross / SMA), **Score Stars** (`sigQuality`), **P&L Exit** (`enablePnL` + `pnlTarget`), and a **Dashboard & Visuals** group (`showDash`, `extDash`, `showCircles`, `showBg`). Every other parameter that was a user input in the parent script is either **auto-tuned** from the asset profile + anchor choice (see [Auto-Tune](#auto-tune-light-build) and the [Profile Parameters Table](#profile-parameters-table)) or **pinned** to its tuned default in a `FIXED BEHAVIOUR` block near the top of the file. The **VWAP Fade** module is removed entirely; the **ORB** module is retired but left inert (`orbEnabled = false` constant) so its router/dashboard/plot code still compiles. To change a tuned value, edit the profile `if/else` chain — not the panel.
 
 ## Development Workflow
 
@@ -23,11 +23,12 @@ SLT keeps two signal anchors: **SMA** (default) and **EMA Cross**. The 5-compone
 The script is organized into sequential sections (read top-to-bottom, order matters in Pine Script):
 
 1. **Constants** — Gate penalty values, dashboard sizing (`DASHBOARD_MAX_ROWS = 36`)
-2. **Inputs** — Three user controls only (see [Auto-Tune](#auto-tune-light-build)):
+2. **Inputs** — minimal surface (see [Auto-Tune](#auto-tune-light-build)):
    - `grp_anchor`: **Signal Anchor** (EMA Cross / SMA) — the mode selector; drives auto-tune
    - `grp_sig`: **Score Stars** (`sigQuality`) — label selectivity on top of the auto min score
    - `grp_pnl`: **P&L Exit** — `enablePnL` + `pnlTarget`
-   - `FIXED BEHAVIOUR` block: `showLabels`, `sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, success-rate + dashboard toggles — all pinned constants, no inputs.
+   - `grp_vis`: **Dashboard & Visuals** — `showDash`, `extDash`, `showCircles`, `showBg`
+   - `FIXED BEHAVIOUR` block: `showLabels`, `sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, `enableSuccessRate`, `maxSignalsToTrack`, `showSignalPnL` — all pinned constants, no inputs.
    - ORB inert-constant block: `orbEnabled=false` + the 7 ORB tuning constants (module code still present).
 3. **Asset profile assignment** — A `switch` on `syminfo.type` first computes `asset_category` (STOCK/FUND/FUTURES/CRYPTO/MARKET); a separate `if/else if` chain keyed on `asset_category` then sets `profile_name`, all scoring threshold variables, the SMA anchor length `sma_len`, **and the four auto-tune fields** `ema_slow_auto` / `sma_buf_auto` / `min_score_auto` / `rth_auto`. Immediately after the chain, an **AUTO-TUNE RESOLUTION** block maps those (plus the anchor choice) to the effective globals the rest of the script reads: `emaSlowPeriod`, `smaBufferATR`, `minScoreBuy`/`minScoreSell` (both = `min_score_auto`), `useSessionFilter` (= `rth_auto`), and `maxBarsFromFlip` (`anchorMode=="SMA" ? 0 : 10`). See [Profile Parameters Table](#profile-parameters-table).
 4. **Core indicator calculations** — EMAs (9, `emaSlow`=profile-auto 20 or 30, 20 fixed for scoring, 50), SMA anchor (`smaLenActive = sma_len`, no MANUAL mode), VWAP, ATR(14), RSI(14), ADX(14,14), MACD(12,26,9), relative volume (`rvolMode` pinned to Time-of-Day, Rolling 20-bar SMA is the automatic thin-history fallback — see [Time-of-Day Relative Volume](#key-design-decisions))
@@ -215,7 +216,7 @@ All threshold variables are assigned once per bar based on `syminfo.type`. The `
 
 ## Auto-Tune (light build)
 
-The parent script exposed ~30 inputs. The light build keeps 3 (Anchor, Score Stars, P&L) and derives or pins the rest.
+The parent script exposed ~30 inputs. The light build keeps a handful — Anchor, Score Stars, P&L Exit, and the Dashboard & Visuals toggles — and derives or pins the rest.
 
 **Derived from the asset profile + anchor** — resolved in the `AUTO-TUNE RESOLUTION` block immediately after the profile `if/else` chain:
 
@@ -227,7 +228,7 @@ The parent script exposed ~30 inputs. The light build keeps 3 (Anchor, Score Sta
 | `useSessionFilter` | `rth_auto` (profile) | `false` for FUTURES + CRYPTO — the RTH filter would black out most of a 24h instrument's day. |
 | `maxBarsFromFlip` | `anchorMode == "SMA" ? 0 : 10` | EMA9/slow crosses lag the turn → cap entry distance; the SMA latch already fires on the flip bar, so no cap. **This is the one parameter that changes when you switch anchors** — keep it in mind for cross-anchor win-rate comparison. |
 
-**Pinned constants** (`FIXED BEHAVIOUR` block, top of file): `showLabels=true`, `sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, `enableSuccessRate=true`, `maxSignalsToTrack=50`, `showSignalPnL=true`, `showDash=true`, `extDash=false`, `showCircles=true`, `showBg=true`.
+**Pinned constants** (`FIXED BEHAVIOUR` block, top of file): `showLabels=true`, `sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, `enableSuccessRate=true`, `maxSignalsToTrack=50`, `showSignalPnL=true`. (`showDash` / `extDash` / `showCircles` / `showBg` are back as inputs in `grp_vis`.)
 
 **Retired modules:** `orbEnabled=false` + 7 ORB tuning constants kept so the (still-present) ORB module, its dashboard row, and its plots compile without ever activating. The VWAP Fade module, its router branch, its plots, its dashboard row, and its inputs are deleted; `mod_results` slot 2 and the `strat_id("VWAP Fade")→2` mapping are left as harmless vestiges to avoid renumbering.
 
@@ -303,7 +304,7 @@ Common failure modes when editing this script:
 No test runner exists. After any edit, verify manually in this order:
 
 1. **Paste into Pine Editor → zero compilation errors** before proceeding
-2. **Settings panel shows exactly 3 controls:** Signal Anchor, Score Stars, and the P&L Exit group (Enable + Target %). No SMA/Signal-timing/RVOL/ORB/Fade/Success/Visuals groups.
+2. **Settings panel shows only:** Signal Anchor, Score Stars, P&L Exit (Enable + Target %), and Dashboard & Visuals (4 toggles). No SMA / Signal-timing / RVOL / ORB / Fade / Success groups.
 3. **Load NVDA 2-min chart** → dashboard appears bottom-right; the **Signal Anchor** row reads `SMA (70) auto ±0.25A` (NVDA = STOCK profile), the **Strategy** row reads `Trend Pullback · <regime>`.
 4. **Score ≤ 100** on the dashboard at all times; confirm the 105-max component sum never overflows the clamp.
 5. **Signal alternation:** let a BUY fire → next BUY blocked until a SELL fires, across multiple trend flips where SELL's quality filter never clears.
@@ -329,4 +330,4 @@ No test runner exists. After any edit, verify manually in this order:
 
 The script file is `SLT.pine`. It was forked from **SuperLazyTrade V3** with the SuperTrend signal anchor removed entirely (input option, SuperTrend Engine settings group, adaptive ATR/factor block, `ta.supertrend` call, `st_*` anchor, its plots/fills/circles, dashboard branch). Anchor selection is binary — SMA (default) or EMA Cross.
 
-**Light-build simplification (current):** the input surface is reduced to 3 controls (Signal Anchor, Score Stars, P&L Exit). Former inputs are auto-tuned from the asset profile + anchor (`ema_slow_auto` / `sma_buf_auto` / `min_score_auto` / `rth_auto` → `emaSlowPeriod` / `smaBufferATR` / `minScore*` / `useSessionFilter`, plus `maxBarsFromFlip` from the anchor) or pinned as constants (`sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, SMA MANUAL mode dropped, all dashboard/success toggles). The **VWAP Fade** module is deleted; the **ORB** module is retained but inert (`orbEnabled=false` constant). Component 1 (EMA Cascade) was also decoupled from the anchor (`c1_bull`/`c1_bear` off `ema9`/`ema20`) so `raw_score` is comparable across anchors. The on-chart `indicator()` title is `SLT V1` (from `VERSION = "V1"`). No changelog history is tracked in the file — treat the current source as the reference behavior going forward.
+**Light-build simplification (current):** the input surface is reduced to Signal Anchor, Score Stars, P&L Exit, and the Dashboard & Visuals toggles (`showDash` / `extDash` / `showCircles` / `showBg`). Former inputs are auto-tuned from the asset profile + anchor (`ema_slow_auto` / `sma_buf_auto` / `min_score_auto` / `rth_auto` → `emaSlowPeriod` / `smaBufferATR` / `minScore*` / `useSessionFilter`, plus `maxBarsFromFlip` from the anchor) or pinned as constants (`sigTime="Score"`, `gateOn=true`, `rvolMode="Time-of-Day"`, SMA MANUAL mode dropped, success-rate + `showSignalPnL` + `showLabels`). The **VWAP Fade** module is deleted; the **ORB** module is retained but inert (`orbEnabled=false` constant). Component 1 (EMA Cascade) was also decoupled from the anchor (`c1_bull`/`c1_bear` off `ema9`/`ema20`) so `raw_score` is comparable across anchors. The on-chart `indicator()` title is `SLT V1` (from `VERSION = "V1"`). No changelog history is tracked in the file — treat the current source as the reference behavior going forward.

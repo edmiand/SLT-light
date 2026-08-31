@@ -86,10 +86,20 @@ enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
 pnlTarget = input.float(1.0, "P&L Target (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = grp_pnl,
      tooltip = "PROFIT/LOSS fires at ±this percent from entry. Default 1.0%.")
 
+grp_vis = "📊 Dashboard & Visuals"
+showDash = input.bool(true, "Show Dashboard", group = grp_vis,
+     tooltip = "Bottom-right metrics table.")
+extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
+     tooltip = "Adds the per-component point breakdown, win-rate rows and diagnostic rows to the dashboard.")
+showCircles = input.bool(true, "Show Trend Flip Circles", group = grp_vis,
+     tooltip = "Mark each anchor flip bar on the chart.")
+showBg   = input.bool(true, "Show Trend Background", group = grp_vis,
+     tooltip = "Tint the chart background by trend direction.")
+
 //======================================================================
 // FIXED BEHAVIOUR
 // User-configurable in the parent script; pinned here to the tuned
-// defaults so the light build stays a 3-control surface.
+// defaults so the light build stays a minimal-control surface.
 //======================================================================
 bool   showLabels        = true
 string sigTime           = "Score"        // fire only when score clears the auto minimum
@@ -99,10 +109,6 @@ int    rvolLookbackDays  = 10
 bool   enableSuccessRate = true
 int    maxSignalsToTrack = 50
 bool   showSignalPnL     = true
-bool   showDash          = true
-bool   extDash           = false
-bool   showCircles       = true
-bool   showBg            = true
 
 // ORB strategy module — retired in the light build. Kept inert
 // (orbEnabled = false) so the router / dashboard / plot code that still
