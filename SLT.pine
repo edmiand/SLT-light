@@ -302,9 +302,6 @@ kcL = bbB - (ta.atr(20) * kc_mult)
 bool is_squeezing = bbU <= kcU and bbL >= kcL
 bool sqz_release  = not is_squeezing and is_squeezing[1]
 
-// Squeeze breakout bias (only valid on release bar)
-string sqz_bias = sqz_release ? (close > open ? "BULL 🟢" : "BEAR 🔴") : "—"
-
 // 2. STRETCH FACTOR — unified measurement of mean-reversion risk (EMA)
 // and trend exhaustion (flip price)
 float ema_stretch = math.abs(close - ema20) / atr  // Distance from EMA20 in ATR units
@@ -1104,8 +1101,10 @@ bool entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip
 // between modules, it never loosens a module's own rules. The signal
 // dispatch layer below then applies session/warm-up/alternation uniformly.
 
-// --- Regime classification (descriptive; informs the dashboard, not a gate) ---
-string regime = is_squeezing ? "SQUEEZE" : sqz_release ? "BREAKOUT" : (stretch_factor > ext_scale and not is_high_velocity) ? "EXHAUSTED" : adx >= adx_min ? "TREND" : "RANGE"
+// (Regime classification removed with the dashboard Strategy row — it was
+// purely descriptive and had no other consumer once VWAP Fade was dropped.
+// A re-added counter-trend module would recompute whatever regime test it
+// needs locally; see CLAUDE.md "VWAP Fade Module".)
 
 // --- Module: Trend Pullback -------------------------------------------------
 // Raw directional trigger + quality gate for this module. sigTime
@@ -1558,17 +1557,7 @@ if showDash and barstate.islast
         anchor_display := "EMA Cross (9/" + str.tostring(emaSlowPeriod) + ") auto"
     
     table.cell(d, 0, row, "Signal Anchor", text_color = color.white, text_halign = text.align_left, text_size = size.small)
-    table.cell(d, 1, row, anchor_display, text_color = color.gray, text_size = size.small)
-    row += 1
-
-    // Strategy + Regime (active_strategy is the router's pick this bar;
-    // regime is descriptive only and gates nothing)
-    string m_state = is_squeezing ? "SQUEEZE 🚧" :
-                     sqz_release ? "BREAKOUT 💥 " + sqz_bias :
-                     regime == "EXHAUSTED" ? "EXHAUSTED 🥵" :
-                     regime == "RANGE" ? "RANGE ↔️" : "📈 TREND"
-    table.cell(d, 0, row, "Strategy", text_color = color.white, text_halign = text.align_left, text_size = size.small)
-    table.cell(d, 1, row, active_strategy + " · " + m_state, text_color = color.white, text_size = size.small)
+    table.cell(d, 1, row, anchor_display, text_color = color.white, text_size = size.small)
     row += 1
 
     // ORB module status (optional row — only when the module is enabled)
