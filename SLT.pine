@@ -804,7 +804,14 @@ else
     stretch_penalty := 0
     stretch_status := "✅ HEALTHY"
 
-bool gate2_stretched = stretch_penalty > 0
+// Velocity override — a genuine high-conviction momentum regime (ADX > 35
+// rising 3 bars, `is_high_velocity`) is allowed to run past the standard
+// extension band, exactly as it already bypasses Gate 3 (ATR Fuel). The raw
+// stretch tier is still computed and shown as advisory in the gate message;
+// only the score penalty is waived.
+bool gate2_raw        = stretch_penalty > 0
+bool gate2_overridden = gate2_raw and is_high_velocity
+bool gate2_stretched  = gate2_raw and not is_high_velocity
 
 //----------------------------------------------------------------------
 // Gate 3: ATR Fuel Exhaustion (Session Range Maxed)
@@ -820,7 +827,7 @@ bool gate4_liquidity = volume_is_dead and is_choppy
 // Calculate penalty values (for display and application)
 //----------------------------------------------------------------------
 int gate1_penalty = gate1_squeeze ? SQUEEZE_PENALTY : 0
-int gate2_penalty = stretch_penalty  // Tiered stretch penalty
+int gate2_penalty = gate2_stretched ? stretch_penalty : 0  // Tiered stretch penalty (waived under velocity override)
 int gate3_penalty = gate3_fuel ? FUEL_PENALTY : 0
 int gate4_penalty = gate4_liquidity ? LIQUIDITY_PENALTY : 0
 
@@ -830,9 +837,12 @@ string gate_message = ""
 if gate1_squeeze
     gate_message += "🚧 SQUEEZE (-" + str.tostring(gate1_penalty) + ") "
 
-if gate2_stretched
+if gate2_raw
     string stretch_detail = str.tostring(stretch_factor, "#.#") + " ATR"
-    gate_message += stretch_status + " (-" + str.tostring(gate2_penalty) + " | " + stretch_detail + ") "
+    if gate2_overridden
+        gate_message += stretch_status + " (🔥 VELOCITY | " + stretch_detail + ") "
+    else
+        gate_message += stretch_status + " (-" + str.tostring(gate2_penalty) + " | " + stretch_detail + ") "
 
 if gate3_fuel
     gate_message += "🛑 ATRFUEL (-" + str.tostring(gate3_penalty) + ") "
@@ -856,6 +866,7 @@ if gateOn
         final_score := math.max(final_score - gate1_penalty, 0)
 
     // Gate 2: Stretch Factor (Unified - Mean Reversion + Trend Exhaustion)
+    // gate2_stretched already excludes the is_high_velocity override.
     if gate2_stretched
         final_score := math.max(final_score - gate2_penalty, 0)
 
@@ -1094,7 +1105,7 @@ bool entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip
 // dispatch layer below then applies session/warm-up/alternation uniformly.
 
 // --- Regime classification (descriptive; informs the dashboard, not a gate) ---
-string regime = is_squeezing ? "SQUEEZE" : sqz_release ? "BREAKOUT" : stretch_factor > ext_scale ? "EXHAUSTED" : adx >= adx_min ? "TREND" : "RANGE"
+string regime = is_squeezing ? "SQUEEZE" : sqz_release ? "BREAKOUT" : (stretch_factor > ext_scale and not is_high_velocity) ? "EXHAUSTED" : adx >= adx_min ? "TREND" : "RANGE"
 
 // --- Module: Trend Pullback -------------------------------------------------
 // Raw directional trigger + quality gate for this module. sigTime
