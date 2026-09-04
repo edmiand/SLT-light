@@ -235,11 +235,40 @@ else
     profile_name := "STANDARD STOCK 📈" // Defaults already set above
 
 //======================================================================
+// TIMEFRAME LENGTH SCALING
+//======================================================================
+// Every bar-count length below (EMA/SMA/ATR/RSI/ADX/BB-KC periods, the
+// 20-bar RVOL fallback, maxBarsFromFlip) was tuned to cover a specific
+// amount of real time on a 2-minute chart — e.g. the STOCK profile's
+// SMA(70) covers ~2.3h. On any other interval a fixed bar count covers a
+// different amount of wall-clock time (SMA(70) on 5-min = ~5.8h). tf_scale
+// rescales each length so it keeps covering the same real-time window
+// regardless of the chart's interval.
+//
+// NOT rescaled: the profile threshold/percentage values (vwap_h_limit,
+// adx_min, ext_scale, fuel_max, rvol tiers) — these were tuned against
+// 2-min bar noise/volatility characteristics and have no comparable
+// scaling law; changing interval still means re-validating those. Also
+// left alone: rvolLookbackDays / maxSignalsToTrack (session/signal
+// counts, not bar-lookback windows) and the 2-3 bar ta.rising() momentum
+// checks (ADX/RSI) — at that length, scaling either collapses to a
+// meaningless 1-bar check or adds complexity for no calibration benefit.
+const int BASE_TF_SECONDS = 120  // 2-minute reference chart
+float tf_scale = timeframe.in_seconds() > 0 ? BASE_TF_SECONDS / timeframe.in_seconds() : 1.0
+
+// Non-intrabar chart types (Range/Tick/Renko) report timeframe.in_seconds()
+// == 0 — no wall-clock equivalent to scale against, so tf_scale falls back
+// to 1.0 (unscaled, matches the original 2-min-tuned bar counts).
+scale_len(int base_len) =>
+    int result = int(math.max(1.0, math.round(base_len * tf_scale)))
+    result
+
+//======================================================================
 // AUTO-TUNE RESOLUTION  (asset profile + anchor -> effective parameters)
 // These names are what the rest of the script reads; in the parent
 // project they were user inputs.
 //======================================================================
-int   emaSlowPeriod    = ema_slow_auto                     // EMA Cross slow leg (20 / 30 by profile)
+int   emaSlowPeriod    = scale_len(ema_slow_auto)          // EMA Cross slow leg (20 / 30 by profile, timeframe-scaled)
 float smaBufferATR     = sma_buf_auto                      // SMA latch band, x ATR-14
 int   minScoreBuy      = min_score_auto                    // auto min score, both directions
 int   minScoreSell     = min_score_auto
@@ -247,32 +276,39 @@ bool  useSessionFilter = rth_auto                          // RTH filter — off
 // Entry-freshness cap (Score mode only): EMA9/slow crosses lag the turn, so
 // cap how far past a flip an entry may fire; the SMA anchor is latched and
 // already fires on the flip bar, so it needs no cap.
-int   maxBarsFromFlip  = anchorMode == "SMA" ? 0 : 10
+int   maxBarsFromFlip  = anchorMode == "SMA" ? 0 : scale_len(10)
 
 //======================================================================
 // CORE INDICATOR CALCULATIONS
 //======================================================================
 
-// EMAs (9 + profile slow period for EMA Cross, 50 for cascade scoring)
-ema9  = ta.ema(close, 9)
+// EMAs (9 + profile slow period for EMA Cross, 50 for cascade scoring).
+// Periods are timeframe-scaled (see TIMEFRAME LENGTH SCALING above) so each
+// one keeps covering the same wall-clock window regardless of chart interval.
+// ema9Period is kept as a named variable (not just inlined into ta.ema) so
+// the dashboard's Signal Anchor row can display the actual resolved period
+// instead of a hardcoded "9".
+int ema9Period = scale_len(9)
+ema9  = ta.ema(close, ema9Period)
 emaSlow = ta.ema(close, emaSlowPeriod)
-ema50 = ta.ema(close, 50)
+ema50 = ta.ema(close, scale_len(50))
 
-// Keep ema20 reference for Component 1 scoring (always uses 20)
-ema20 = ta.ema(close, 20)
+// Keep ema20 reference for Component 1 scoring (always uses 20, timeframe-scaled)
+ema20 = ta.ema(close, scale_len(20))
 
 // SMA anchor — only drives signals when anchorMode == "SMA", but computed on
-// every bar like every other series here. Length is the per-profile sma_len.
-int smaLenActive = sma_len
+// every bar like every other series here. Length is the per-profile sma_len,
+// timeframe-scaled.
+int smaLenActive = scale_len(sma_len)
 smaAnchor = ta.sma(close, smaLenActive)
 
 // VWAP (Session-based - Component 2)
 vwap = ta.vwap(close)
 
-// Volatility & Momentum
-atr = ta.atr(14)
-rsiVal = ta.rsi(close, 14)
-[_, _, adx] = ta.dmi(14, 14)
+// Volatility & Momentum (periods timeframe-scaled)
+atr = ta.atr(scale_len(14))
+rsiVal = ta.rsi(close, scale_len(14))
+[_, _, adx] = ta.dmi(scale_len(14), scale_len(14))
 
 
 // Consolidated ADX trend detection (used by multiple components)
@@ -293,11 +329,11 @@ var float trend_start_price = na  // Price at anchor flip
 // MARKET REGIME DETECTION
 //======================================================================
 
-// 1. SQUEEZE STATE (Bollinger Bands vs Keltner Channels)
-[bbU, bbB, bbL] = ta.bb(close, 20, 2.0)
+// 1. SQUEEZE STATE (Bollinger Bands vs Keltner Channels) — length timeframe-scaled
+[bbU, bbB, bbL] = ta.bb(close, scale_len(20), 2.0)
 kc_mult = 1.5
-kcU = bbB + (ta.atr(20) * kc_mult)
-kcL = bbB - (ta.atr(20) * kc_mult)
+kcU = bbB + (ta.atr(scale_len(20)) * kc_mult)
+kcL = bbB - (ta.atr(scale_len(20)) * kc_mult)
 
 bool is_squeezing = bbU <= kcU and bbL >= kcL
 bool sqz_release  = not is_squeezing and is_squeezing[1]
@@ -394,7 +430,7 @@ tod_slot_idx += 1
 
 // Relative Volume: Rolling 20-bar (always computed, used as fallback) +
 // Time-of-Day (used when selected and sufficient history exists)
-vol_ma20 = ta.sma(volume, 20)
+vol_ma20 = ta.sma(volume, scale_len(20))
 // The `: 1.0` fallback is what makes volume-less feeds (index symbols such as
 // TVC:NDQ or TSX:TSX, where volume is na/0) behave sanely: rel_vol becomes a
 // neutral 1.0 instead of na. Two consequences depend on that exact value —
@@ -1554,7 +1590,7 @@ if showDash and barstate.islast
     if anchorMode == "SMA"
         anchor_display := "SMA (" + str.tostring(smaLenActive) + ") auto ±" + str.tostring(smaBufferATR, "#.##") + "A"
     else  // EMA Cross
-        anchor_display := "EMA Cross (9/" + str.tostring(emaSlowPeriod) + ") auto"
+        anchor_display := "EMA Cross (" + str.tostring(ema9Period) + "/" + str.tostring(emaSlowPeriod) + ") auto"
     
     table.cell(d, 0, row, "Signal Anchor", text_color = color.white, text_halign = text.align_left, text_size = size.small)
     table.cell(d, 1, row, anchor_display, text_color = color.white, text_size = size.small)
