@@ -259,16 +259,29 @@ float tf_scale = timeframe.in_seconds() > 0 ? BASE_TF_SECONDS / timeframe.in_sec
 // Non-intrabar chart types (Range/Tick/Renko) report timeframe.in_seconds()
 // == 0 — no wall-clock equivalent to scale against, so tf_scale falls back
 // to 1.0 (unscaled, matches the original 2-min-tuned bar counts).
-scale_len(int base_len) =>
-    int result = int(math.max(1.0, math.round(base_len * tf_scale)))
-    result
+//
+// ta.ema/ta.sma/ta.atr/ta.rsi/ta.dmi/ta.bb all require a "simple int"
+// length. A user-defined function's result is always widened to "series"
+// by the compiler — even one that only does arithmetic on already-"simple"
+// inputs, because Pine can't verify a function stays simple across all
+// possible call sites (CE10123 if you route this through a scale_len()
+// helper instead). So each scaled length is computed inline here as a
+// plain expression and reused by variable reference, which does preserve
+// the "simple" qualifier. The four base periods below (9/14/20/50) are
+// deduplicated into named "simple int" vars since several are reused by
+// more than one ta.* call.
+int len9  = int(math.max(1.0, math.round(9  * tf_scale)))
+int len14 = int(math.max(1.0, math.round(14 * tf_scale)))
+int len20 = int(math.max(1.0, math.round(20 * tf_scale)))
+int len50 = int(math.max(1.0, math.round(50 * tf_scale)))
+int len10 = int(math.max(1.0, math.round(10 * tf_scale)))
 
 //======================================================================
 // AUTO-TUNE RESOLUTION  (asset profile + anchor -> effective parameters)
 // These names are what the rest of the script reads; in the parent
 // project they were user inputs.
 //======================================================================
-int   emaSlowPeriod    = scale_len(ema_slow_auto)          // EMA Cross slow leg (20 / 30 by profile, timeframe-scaled)
+int   emaSlowPeriod    = int(math.max(1.0, math.round(ema_slow_auto * tf_scale)))  // EMA Cross slow leg (20 / 30 by profile, timeframe-scaled)
 float smaBufferATR     = sma_buf_auto                      // SMA latch band, x ATR-14
 int   minScoreBuy      = min_score_auto                    // auto min score, both directions
 int   minScoreSell     = min_score_auto
@@ -276,7 +289,7 @@ bool  useSessionFilter = rth_auto                          // RTH filter — off
 // Entry-freshness cap (Score mode only): EMA9/slow crosses lag the turn, so
 // cap how far past a flip an entry may fire; the SMA anchor is latched and
 // already fires on the flip bar, so it needs no cap.
-int   maxBarsFromFlip  = anchorMode == "SMA" ? 0 : scale_len(10)
+int   maxBarsFromFlip  = anchorMode == "SMA" ? 0 : len10
 
 //======================================================================
 // CORE INDICATOR CALCULATIONS
@@ -288,27 +301,27 @@ int   maxBarsFromFlip  = anchorMode == "SMA" ? 0 : scale_len(10)
 // ema9Period is kept as a named variable (not just inlined into ta.ema) so
 // the dashboard's Signal Anchor row can display the actual resolved period
 // instead of a hardcoded "9".
-int ema9Period = scale_len(9)
+int ema9Period = len9
 ema9  = ta.ema(close, ema9Period)
 emaSlow = ta.ema(close, emaSlowPeriod)
-ema50 = ta.ema(close, scale_len(50))
+ema50 = ta.ema(close, len50)
 
 // Keep ema20 reference for Component 1 scoring (always uses 20, timeframe-scaled)
-ema20 = ta.ema(close, scale_len(20))
+ema20 = ta.ema(close, len20)
 
 // SMA anchor — only drives signals when anchorMode == "SMA", but computed on
 // every bar like every other series here. Length is the per-profile sma_len,
 // timeframe-scaled.
-int smaLenActive = scale_len(sma_len)
+int smaLenActive = int(math.max(1.0, math.round(sma_len * tf_scale)))
 smaAnchor = ta.sma(close, smaLenActive)
 
 // VWAP (Session-based - Component 2)
 vwap = ta.vwap(close)
 
 // Volatility & Momentum (periods timeframe-scaled)
-atr = ta.atr(scale_len(14))
-rsiVal = ta.rsi(close, scale_len(14))
-[_, _, adx] = ta.dmi(scale_len(14), scale_len(14))
+atr = ta.atr(len14)
+rsiVal = ta.rsi(close, len14)
+[_, _, adx] = ta.dmi(len14, len14)
 
 
 // Consolidated ADX trend detection (used by multiple components)
@@ -330,10 +343,10 @@ var float trend_start_price = na  // Price at anchor flip
 //======================================================================
 
 // 1. SQUEEZE STATE (Bollinger Bands vs Keltner Channels) — length timeframe-scaled
-[bbU, bbB, bbL] = ta.bb(close, scale_len(20), 2.0)
+[bbU, bbB, bbL] = ta.bb(close, len20, 2.0)
 kc_mult = 1.5
-kcU = bbB + (ta.atr(scale_len(20)) * kc_mult)
-kcL = bbB - (ta.atr(scale_len(20)) * kc_mult)
+kcU = bbB + (ta.atr(len20) * kc_mult)
+kcL = bbB - (ta.atr(len20) * kc_mult)
 
 bool is_squeezing = bbU <= kcU and bbL >= kcL
 bool sqz_release  = not is_squeezing and is_squeezing[1]
@@ -430,7 +443,7 @@ tod_slot_idx += 1
 
 // Relative Volume: Rolling 20-bar (always computed, used as fallback) +
 // Time-of-Day (used when selected and sufficient history exists)
-vol_ma20 = ta.sma(volume, scale_len(20))
+vol_ma20 = ta.sma(volume, len20)
 // The `: 1.0` fallback is what makes volume-less feeds (index symbols such as
 // TVC:NDQ or TSX:TSX, where volume is na/0) behave sanely: rel_vol becomes a
 // neutral 1.0 instead of na. Two consequences depend on that exact value —
