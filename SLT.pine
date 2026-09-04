@@ -45,10 +45,11 @@ type ModResults
     array<bool> sells
 
 //======================================================================
-// INPUTS  —  SLT-light: three user controls
+// INPUTS  —  SLT-light: four user controls
 //   1. Signal Anchor  (EMA Cross / SMA)
 //   2. Score Stars    (label selectivity)
 //   3. P&L Exit        (on/off + target %)
+//   4. Trading Hours   (session window — applies to every asset type)
 // Everything else is auto-tuned from the asset profile (see the profile
 // block below) and the anchor choice. To hand-tune, edit the profile
 // table — not the settings panel.
@@ -66,7 +67,7 @@ anchorMode = input.string("SMA", "Signal Anchor",
                "• Signals on price crossing a slow structural SMA\n" +
                "• Slowest anchor — ATR buffer band + latched state kills whipsaw\n" +
                "• Best for: choppy instruments, fewer / higher-conviction entries\n\n" +
-               "Slow-EMA period, SMA length, SMA buffer, min score, RTH filter and\n" +
+               "Slow-EMA period, SMA length, SMA buffer, min score and\n" +
                "entry-freshness are all set automatically from the asset profile\n" +
                "and this choice. Both anchors share the same scoring / gates.")
 
@@ -85,6 +86,13 @@ enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
      tooltip = "Show PROFIT/LOSS exit markers when price moves ±target % from entry.")
 pnlTarget = input.float(1.0, "P&L Target (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = grp_pnl,
      tooltip = "PROFIT/LOSS fires at ±this percent from entry. Default 1.0%.")
+
+grp_hours = "🕐 Trading Hours"
+tradingHours = input.session("0930-1600:23456", "Trading Hours", group = grp_hours,
+     tooltip = "Session window signals are allowed to fire in. Applies to EVERY asset type, " +
+               "including 24h futures/crypto — previously those traded with no hours restriction " +
+               "at all, which is what let signals fire outside your actual trading hours. Uses the " +
+               "chart's exchange timezone. Default 09:30–16:00, Mon–Fri (US market hours).")
 
 grp_vis = "📊 Dashboard & Visuals"
 showDash = input.bool(true, "Show Dashboard", group = grp_vis,
@@ -147,7 +155,6 @@ int   sma_len      = 70    // SMA anchor length (default)
 int   ema_slow_auto  = 30    // EMA Cross slow leg
 float sma_buf_auto   = 0.25  // SMA latch band (x ATR-14)
 int   min_score_auto = 50    // auto min score, both directions
-bool  rth_auto       = true  // RTH session filter (off for 24h profiles)
 string profile_name = "DEFAULT"
 
 // 3. Profile Assignment Logic
@@ -165,7 +172,6 @@ if asset_category == "MARKET"
     ema_slow_auto := 30
     sma_buf_auto := 0.20
     min_score_auto := 55
-    rth_auto := true
 
 else if asset_category == "FUND"
     profile_name := "ETF / FUND 📊"
@@ -181,7 +187,6 @@ else if asset_category == "FUND"
     ema_slow_auto := 30
     sma_buf_auto := 0.20
     min_score_auto := 50
-    rth_auto := true
 
 else if asset_category == "STOCK"
     profile_name := "STOCK 🚀"
@@ -197,7 +202,6 @@ else if asset_category == "STOCK"
     ema_slow_auto := 20
     sma_buf_auto := 0.25
     min_score_auto := 50
-    rth_auto := true
 
 else if asset_category == "FUTURES"
     profile_name := "FUTURES ⚡"
@@ -213,7 +217,6 @@ else if asset_category == "FUTURES"
     ema_slow_auto := 30
     sma_buf_auto := 0.30
     min_score_auto := 45
-    rth_auto := false   // 24h contract — RTH filter would blackout most of the day
 
 else if asset_category == "CRYPTO"
     profile_name := "CRYPTO 🪙"
@@ -229,7 +232,6 @@ else if asset_category == "CRYPTO"
     ema_slow_auto := 20
     sma_buf_auto := 0.35
     min_score_auto := 55
-    rth_auto := false   // 24h market — RTH filter would blackout most of the day
 
 else
     profile_name := "STANDARD STOCK 📈" // Defaults already set above
@@ -285,7 +287,6 @@ int   emaSlowPeriod    = int(math.max(1.0, math.round(ema_slow_auto * tf_scale))
 float smaBufferATR     = sma_buf_auto                      // SMA latch band, x ATR-14
 int   minScoreBuy      = min_score_auto                    // auto min score, both directions
 int   minScoreSell     = min_score_auto
-bool  useSessionFilter = rth_auto                          // RTH filter — off for 24h profiles (FUTURES / CRYPTO)
 // Entry-freshness cap (Score mode only): EMA9/slow crosses lag the turn, so
 // cap how far past a flip an entry may fire; the SMA anchor is latched and
 // already fires on the flip bar, so it needs no cap.
@@ -956,14 +957,19 @@ var string last_signal_type = "NONE"
 var bool has_previous_signal = false
 
 //======================================================================
-// RTH SESSION WINDOW
+// TRADING HOURS SESSION WINDOW
 //======================================================================
 // Defined here (ahead of P&L exit tracking) because the session-open reset
 // must clear stale position state BEFORE current_pnl / PROFIT / LOSS are
 // evaluated on the session-open bar itself.
-bool in_session       = not useSessionFilter or not na(time(timeframe.period, "0930-1600:23456"))
-bool prev_in_session   = not na(time(timeframe.period, "0930-1600:23456")[1])
-bool session_just_opened = useSessionFilter and in_session and not prev_in_session
+//
+// tradingHours (user input, default "0930-1600:23456") now applies to EVERY
+// asset type uniformly, including 24h futures/crypto — there is no more
+// per-profile on/off (previously FUTURES/CRYPTO resolved rth_auto = false
+// and traded with no hours restriction at all).
+bool in_session       = not na(time(timeframe.period, tradingHours))
+bool prev_in_session   = not na(time(timeframe.period, tradingHours)[1])
+bool session_just_opened = in_session and not prev_in_session
 
 //======================================================================
 // P&L EXIT TRACKING
@@ -1197,13 +1203,13 @@ else  // "Score"
 int tp_quality = final_score
 
 // --- Module: Opening Range Breakout ---------------------------------------
-// Range = high/low of the first orbMinutes of the RTH session, latched once
-// the window closes. Then the first confirmed close that clears a range edge
-// (by orbBufferATR x ATR-14), within orbEntryCutoffMin of the open, with
-// enough volume / VWAP alignment / setup quality, fires ONE breakout per
-// session. Anchored to session_just_opened, so it needs useSessionFilter ON;
-// with the filter off orb_open_time stays na, the range never locks, and the
-// module is inert. Non-repainting: the range only latches on a confirmed bar
+// Range = high/low of the first orbMinutes of the trading-hours session,
+// latched once the window closes. Then the first confirmed close that clears
+// a range edge (by orbBufferATR x ATR-14), within orbEntryCutoffMin of the
+// open, with enough volume / VWAP alignment / setup quality, fires ONE
+// breakout per session. Anchored to session_just_opened, which now fires for
+// every asset type (tradingHours applies universally — see TRADING HOURS
+// SESSION WINDOW). Non-repainting: the range only latches on a confirmed bar
 // and every breakout term requires barstate.isconfirmed.
 var int   orb_open_time = na    // epoch ms of the RTH open bar (session anchor)
 var float orb_high      = na
@@ -1649,10 +1655,11 @@ if showDash and barstate.islast
     table.cell(d, 1, row, anchor_display, text_color = color.white, text_size = size.small)
     row += 1
 
-    // ORB module status (optional row — only when the module is enabled)
+    // ORB module status (optional row — only when the module is enabled).
+    // tradingHours now applies to every asset type, so there is no more
+    // "filter off" case to report here.
     if orbEnabled
-        string orb_dash = not useSessionFilter ? "⚠️ needs RTH filter" :
-                          na(orb_open_time) ? "waiting for open" :
+        string orb_dash = na(orb_open_time) ? "waiting for open" :
                           not orb_locked ? "forming " + str.tostring(orb_high, format.mintick) + " / " + str.tostring(orb_low, format.mintick) :
                           orb_done ? "✅ fired this session" :
                           "armed " + str.tostring(orb_high, format.mintick) + " / " + str.tostring(orb_low, format.mintick) + "  Q" + str.tostring(orb_quality)
