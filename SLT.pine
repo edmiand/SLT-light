@@ -997,6 +997,7 @@ var float pnl_entry_price = na          // Entry price for current position
 var string pnl_direction = "NONE"       // "BUY" or "SELL" or "NONE"
 var bool pnl_exit_fired = false         // Has PROFIT/LOSS fired for this entry?
 var string pnl_exit_type = "NONE"       // Direction of the entry an exit closed
+var int pnl_entry_bar = na              // bar_index the current entry opened on
 
 // Flatten at RTH session open. The win-rate tracker already closes any
 // carried-over entry at this boundary (see SIGNAL GENERATION), so leaving
@@ -1008,6 +1009,7 @@ if session_just_opened
     pnl_direction := "NONE"
     pnl_exit_fired := false
     pnl_exit_type := "NONE"
+    pnl_entry_bar := na
 
 // Calculate current P&L for exit tracking
 float current_pnl = 0.0
@@ -1043,7 +1045,29 @@ if pnl_direction == "BUY" and not na(pnl_entry_price)
 else if pnl_direction == "SELL" and not na(pnl_entry_price)
     day_end_pnl := ((pnl_entry_price - close[1]) / pnl_entry_price) * 100
 
-bool day_end_close    = session_just_closed and pnl_direction != "NONE" and not pnl_exit_fired and barstate.isconfirmed
+// Fallback trigger for a tradingHours window that covers every bar (e.g.
+// widened to "0000-2359:1234567" for a 24h symbol, per this script's own
+// guidance for removing hours restriction) — session_just_closed can never
+// fire there since in_session never goes false, so day-end forced resolution
+// would otherwise never engage and a stuck position could carry indefinitely,
+// contradicting the "every entry resolves same day" guarantee. Falls back to
+// the calendar-day rollover (is_new_session, the same detector already used
+// for the daily ATR fuel gauge / Time-of-Day RVOL) whenever in_session never
+// dipped false around it. Excludes any bar where the position already
+// resolved normally this same bar (target_hit/stop_hit), so the two paths
+// can never both claim the same exit.
+bool day_end_fallback = is_new_session and in_session and prev_in_session and not target_hit and not stop_hit
+bool day_end_trigger  = session_just_closed or day_end_fallback
+
+// Requires the entry to have opened at least one bar before the trigger bar
+// (pnl_entry_bar < bar_index - 1) — otherwise the entry opened on the very
+// last bar the trigger is resolving, so close[1] IS the entry price and
+// day_end_pnl is a trivial, meaningless exact-zero. Such an entry never had
+// any real market exposure, so it's left unresolved (excluded from win/loss,
+// same as any other same-day reversal that never hit target or stop) instead
+// of being force-scored as a zero-P&L win.
+bool day_end_close    = day_end_trigger and pnl_direction != "NONE" and not pnl_exit_fired and
+     barstate.isconfirmed and not na(pnl_entry_bar) and pnl_entry_bar < bar_index - 1
 bool day_end_win_hit  = day_end_close and day_end_pnl >= 0
 bool day_end_loss_hit = day_end_close and day_end_pnl < 0
 
@@ -1447,11 +1471,13 @@ if signal_buy
     pnl_entry_price := close
     pnl_direction := "BUY"
     pnl_exit_fired := false
+    pnl_entry_bar := bar_index
 
 if signal_sell
     pnl_entry_price := close
     pnl_direction := "SELL"
     pnl_exit_fired := false
+    pnl_entry_bar := bar_index
 
 //======================================================================
 // LIVE P&L TRACKING (DASHBOARD DISPLAY)
@@ -1577,14 +1603,16 @@ if signal_sell and showLabels
 // PROFIT/LOSS EXIT LABELS WITH ANCHOR-AWARE POSITIONING
 //======================================================================
 if signal_profit and enablePnL
-    // normal_target_reached only fires while in_session; day_end_win_hit
-    // only fires on session_just_closed (not in_session) — mutually
-    // exclusive by construction, so in_session alone tells us which path
-    // resolved this bar. Day-end: show the actual P&L and anchor the label
-    // back to the real last-in-session bar (bar_index - 1 / close[1]),
-    // since the code itself runs one bar late (see DAY-END FORCED
-    // RESOLUTION). Normal: fixed target text, anchored to this bar as usual.
-    bool  is_day_end   = not in_session
+    // normal_target_reached and day_end_win_hit are mutually exclusive by
+    // construction (see DAY-END FORCED RESOLUTION), so checking day_end_win_hit
+    // directly tells us which path resolved this bar — correct whether the
+    // day-end path fired via the off-hours session_just_closed bar or the
+    // same-bar calendar-rollover fallback (where in_session stays true
+    // throughout, so "not in_session" would misidentify the path). Day-end:
+    // show the actual P&L and anchor the label back to the real last-bar-of-
+    // the-period (bar_index - 1 / close[1]), since the code itself runs one
+    // bar late. Normal: fixed target text, anchored to this bar as usual.
+    bool  is_day_end   = day_end_win_hit
     string label_text  = is_day_end ? "PROFIT " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "PROFIT +" + str.tostring(pnlTarget, "#.#") + "%"
     int   label_bar    = is_day_end ? bar_index - 1 : bar_index
     float label_price  = is_day_end ? close[1] : anchor_line_price
@@ -1608,9 +1636,9 @@ if signal_profit and enablePnL
          size = size.normal)
 
 if signal_loss and enablePnL
-    // See signal_profit above — same in_session split determines which path
-    // resolved this bar and how the label is anchored.
-    bool  is_day_end   = not in_session
+    // See signal_profit above — day_end_loss_hit directly identifies which
+    // path resolved this bar and how the label is anchored.
+    bool  is_day_end   = day_end_loss_hit
     string label_text  = is_day_end ? "LOSS " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "LOSS -" + str.tostring(pnlTarget, "#.#") + "%"
     int   label_bar    = is_day_end ? bar_index - 1 : bar_index
     float label_price  = is_day_end ? close[1] : anchor_line_price
