@@ -83,7 +83,11 @@ sigQuality = input.string("⭐ +", "Score Stars",
 
 grp_pnl = "💰 P&L Exit Signals"
 enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
-     tooltip = "Show PROFIT/LOSS exit markers when price moves ±target % from entry.")
+     tooltip = "Show PROFIT/LOSS exit markers when price moves ±target % from entry. If a position " +
+               "is still open at the last bar of Trading Hours without having reached ±target, it's " +
+               "force-closed there instead — PROFIT if it's net positive, LOSS if net negative, using " +
+               "the actual % (not the target) — so no position (or its exit label) ever carries past " +
+               "your trading hours.")
 pnlTarget = input.float(1.0, "P&L Target (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = grp_pnl,
      tooltip = "PROFIT/LOSS fires at ±this percent from entry. Default 1.0%.")
 
@@ -971,6 +975,20 @@ bool in_session       = not na(time(timeframe.period, tradingHours))
 bool prev_in_session   = not na(time(timeframe.period, tradingHours)[1])
 bool session_just_opened = in_session and not prev_in_session
 
+// Mirrors session_just_opened exactly (same proven in_session/prev_in_session
+// primitives, just inverted) — fires on the FIRST bar AFTER the trading-hours
+// session ends. Used to force-resolve any still-open position at day's end;
+// see DAY-END FORCED RESOLUTION below. (An earlier attempt tried to detect
+// the LAST in-session bar directly via time_close(timeframe.period,
+// tradingHours), reasoning that it would return na once a bar's close time
+// crosses the session boundary — it didn't behave that way in practice and
+// the condition never fired. Detecting the bar AFTER close, which reuses the
+// exact mechanism session_just_opened already relies on, is far more
+// reliable; the trade-off is that this fires one bar late; the day-end
+// close logic below anchors its label/alert back to the correct prior bar
+// using close[1]/bar_index[1] to compensate.)
+bool session_just_closed = not in_session and prev_in_session
+
 //======================================================================
 // P&L EXIT TRACKING
 //======================================================================
@@ -998,17 +1016,44 @@ if pnl_direction == "BUY" and not na(pnl_entry_price)
 else if pnl_direction == "SELL" and not na(pnl_entry_price)
     current_pnl := ((pnl_entry_price - close) / pnl_entry_price) * 100
 
-// Target/stop hit detection
+// Target/stop hit detection — normal, in-session path only.
 bool target_hit = current_pnl >= pnlTarget
 bool stop_hit = current_pnl <= -pnlTarget
+bool normal_target_reached = not pnl_exit_fired and barstate.isconfirmed and in_session and target_hit
+bool normal_stop_reached   = not pnl_exit_fired and barstate.isconfirmed and in_session and stop_hit
 
-// Target/stop resolution is tracked INTERNALLY regardless of enablePnL, on a
-// confirmed bar, and only once per entry. Win-rate tracking reads these — if
+//----------------------------------------------------------------------
+// DAY-END FORCED RESOLUTION
+//----------------------------------------------------------------------
+// If a position is still open and hasn't hit +/-pnlTarget by the time the
+// trading-hours session ends, force-close it using the sign of its P&L at
+// that point — instead of letting it drift through off-hours bars (which is
+// what used to let PROFIT/LOSS fire outside trading hours, since current_pnl
+// kept evaluating on every bar regardless of session) or carrying it
+// silently into the next session where it would be excluded as unresolved.
+//
+// Evaluated on session_just_closed (the first OFF-hours bar), using close[1]
+// (the actual last in-session bar's close) rather than the current bar's
+// close, which may already have drifted further after hours. The label/alert
+// gets anchored back to bar_index[1]/close[1] at the draw site so it appears
+// at the correct spot on the chart even though the code runs one bar late.
+float day_end_pnl = 0.0
+if pnl_direction == "BUY" and not na(pnl_entry_price)
+    day_end_pnl := ((close[1] - pnl_entry_price) / pnl_entry_price) * 100
+else if pnl_direction == "SELL" and not na(pnl_entry_price)
+    day_end_pnl := ((pnl_entry_price - close[1]) / pnl_entry_price) * 100
+
+bool day_end_close    = session_just_closed and pnl_direction != "NONE" and not pnl_exit_fired and barstate.isconfirmed
+bool day_end_win_hit  = day_end_close and day_end_pnl >= 0
+bool day_end_loss_hit = day_end_close and day_end_pnl < 0
+
+// Target/stop resolution is tracked INTERNALLY regardless of enablePnL, only
+// once per entry (not pnl_exit_fired). Win-rate tracking reads these — if
 // they were gated on enablePnL, turning off "Enable P&L Exit Signals" (a
 // display toggle) would silently make every tracked signal score as a loss
 // and pin both win rates at 0%.
-bool target_reached = not pnl_exit_fired and target_hit and barstate.isconfirmed
-bool stop_reached   = not pnl_exit_fired and stop_hit and barstate.isconfirmed
+bool target_reached = normal_target_reached or day_end_win_hit
+bool stop_reached   = normal_stop_reached or day_end_loss_hit
 
 // Visible PROFIT/LOSS exit signals (labels + alerts) — display-gated.
 bool signal_profit = target_reached and enablePnL
@@ -1532,9 +1577,17 @@ if signal_sell and showLabels
 // PROFIT/LOSS EXIT LABELS WITH ANCHOR-AWARE POSITIONING
 //======================================================================
 if signal_profit and enablePnL
-    string label_text = "PROFIT +" + str.tostring(pnlTarget, "#.#") + "%"
-    // Anchor-aware label position (see anchor_line_price definition)
-    float label_price = anchor_line_price
+    // normal_target_reached only fires while in_session; day_end_win_hit
+    // only fires on session_just_closed (not in_session) — mutually
+    // exclusive by construction, so in_session alone tells us which path
+    // resolved this bar. Day-end: show the actual P&L and anchor the label
+    // back to the real last-in-session bar (bar_index - 1 / close[1]),
+    // since the code itself runs one bar late (see DAY-END FORCED
+    // RESOLUTION). Normal: fixed target text, anchored to this bar as usual.
+    bool  is_day_end   = not in_session
+    string label_text  = is_day_end ? "PROFIT " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "PROFIT +" + str.tostring(pnlTarget, "#.#") + "%"
+    int   label_bar    = is_day_end ? bar_index - 1 : bar_index
+    float label_price  = is_day_end ? close[1] : anchor_line_price
     string label_style = label.style_label_up
 
     if signal_buy
@@ -1547,7 +1600,7 @@ if signal_profit and enablePnL
         else if pnl_exit_type == "SELL"
             label_style := label.style_label_down
 
-    label.new(bar_index, label_price, label_text,
+    label.new(label_bar, label_price, label_text,
          yloc = yloc.price,
          style = label_style,
          color = color.new(color.blue, 0),
@@ -1555,9 +1608,12 @@ if signal_profit and enablePnL
          size = size.normal)
 
 if signal_loss and enablePnL
-    string label_text = "LOSS -" + str.tostring(pnlTarget, "#.#") + "%"
-    // Anchor-aware label position (see anchor_line_price definition)
-    float label_price = anchor_line_price
+    // See signal_profit above — same in_session split determines which path
+    // resolved this bar and how the label is anchored.
+    bool  is_day_end   = not in_session
+    string label_text  = is_day_end ? "LOSS " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "LOSS -" + str.tostring(pnlTarget, "#.#") + "%"
+    int   label_bar    = is_day_end ? bar_index - 1 : bar_index
+    float label_price  = is_day_end ? close[1] : anchor_line_price
     string label_style = label.style_label_down
 
     if signal_buy
@@ -1570,7 +1626,7 @@ if signal_loss and enablePnL
         else if pnl_exit_type == "SELL"
             label_style := label.style_label_up
 
-    label.new(bar_index, label_price, label_text,
+    label.new(label_bar, label_price, label_text,
          yloc = yloc.price,
          style = label_style,
          color = color.new(color.blue, 0),
