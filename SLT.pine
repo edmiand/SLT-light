@@ -1015,6 +1015,7 @@ var string pnl_direction = "NONE"       // "BUY" or "SELL" or "NONE"
 var bool pnl_exit_fired = false         // Has PROFIT/LOSS fired for this entry?
 var string pnl_exit_type = "NONE"       // Direction of the entry an exit closed
 var int pnl_entry_bar = na              // bar_index the current entry opened on
+var float day_end_frozen_pnl = na       // Live-P&L freeze value once day-end-resolved
 
 // Flatten at RTH session open. The win-rate tracker already closes any
 // carried-over entry at this boundary (see SIGNAL GENERATION), so leaving
@@ -1027,6 +1028,7 @@ if session_just_opened
     pnl_exit_fired := false
     pnl_exit_type := "NONE"
     pnl_entry_bar := na
+    day_end_frozen_pnl := na
 
 // Calculate current P&L for exit tracking
 float current_pnl = 0.0
@@ -1051,17 +1053,6 @@ bool normal_stop_reached   = not pnl_exit_fired and barstate.isconfirmed and in_
 // kept evaluating on every bar regardless of session) or carrying it
 // silently into the next session where it would be excluded as unresolved.
 //
-// Evaluated on session_just_closed (the first OFF-hours bar), using close[1]
-// (the actual last in-session bar's close) rather than the current bar's
-// close, which may already have drifted further after hours. The label/alert
-// gets anchored back to bar_index[1]/close[1] at the draw site so it appears
-// at the correct spot on the chart even though the code runs one bar late.
-float day_end_pnl = 0.0
-if pnl_direction == "BUY" and not na(pnl_entry_price)
-    day_end_pnl := ((close[1] - pnl_entry_price) / pnl_entry_price) * 100
-else if pnl_direction == "SELL" and not na(pnl_entry_price)
-    day_end_pnl := ((pnl_entry_price - close[1]) / pnl_entry_price) * 100
-
 // Fallback trigger for a tradingHours window that covers every bar (e.g.
 // widened to "0000-2359:1234567" for a 24h symbol, per this script's own
 // guidance for removing hours restriction) — session_just_closed can never
@@ -1076,6 +1067,21 @@ else if pnl_direction == "SELL" and not na(pnl_entry_price)
 bool day_end_fallback = is_new_session and in_session and prev_in_session and not target_hit and not stop_hit
 bool day_end_trigger  = session_just_closed or day_end_fallback
 
+// Evaluated on day_end_trigger (the first OFF-hours bar, or the calendar-
+// rollover fallback bar), using close[1] (the actual last bar of the period
+// that just ended) rather than the current bar's close, which may already
+// have drifted further. The label/alert gets anchored back to
+// bar_index[1]/close[1] at the draw site so it appears at the correct spot
+// on the chart even though the code runs one bar late. Gated on
+// day_end_trigger since it's otherwise read only on that one bar per day —
+// no need to pay the division on every other confirmed bar.
+float day_end_pnl = 0.0
+if day_end_trigger
+    if pnl_direction == "BUY" and not na(pnl_entry_price)
+        day_end_pnl := ((close[1] - pnl_entry_price) / pnl_entry_price) * 100
+    else if pnl_direction == "SELL" and not na(pnl_entry_price)
+        day_end_pnl := ((pnl_entry_price - close[1]) / pnl_entry_price) * 100
+
 // Requires the entry to have opened at least one bar before the trigger bar
 // (pnl_entry_bar < bar_index - 1) — otherwise the entry opened on the very
 // last bar the trigger is resolving, so close[1] IS the entry price and
@@ -1087,6 +1093,15 @@ bool day_end_close    = day_end_trigger and pnl_direction != "NONE" and not pnl_
      barstate.isconfirmed and not na(pnl_entry_bar) and pnl_entry_bar < bar_index - 1
 bool day_end_win_hit  = day_end_close and day_end_pnl >= 0
 bool day_end_loss_hit = day_end_close and day_end_pnl < 0
+
+// Freezes the dashboard's live P&L display at this final value once
+// day-end-resolved — otherwise it kept recomputing off the current (possibly
+// drifting, off-hours) close even after the outcome was already permanently
+// scored from close[1], visually contradicting the recorded result. A normal
+// in-session target/stop hit deliberately keeps updating live (see LIVE P&L
+// TRACKING below) — this freeze applies to the day-end path only.
+if day_end_close
+    day_end_frozen_pnl := day_end_pnl
 
 // Target/stop resolution is tracked INTERNALLY regardless of enablePnL, only
 // once per entry (not pnl_exit_fired). Win-rate tracking reads these — if
@@ -1500,21 +1515,28 @@ if signal_buy
     pnl_direction := "BUY"
     pnl_exit_fired := false
     pnl_entry_bar := bar_index
+    day_end_frozen_pnl := na
 
 if signal_sell
     pnl_entry_price := close
     pnl_direction := "SELL"
     pnl_exit_fired := false
     pnl_entry_bar := bar_index
+    day_end_frozen_pnl := na
 
 //======================================================================
 // LIVE P&L TRACKING (DASHBOARD DISPLAY)
 //======================================================================
 // Dashboard P&L uses the same entry price as PROFIT/LOSS tracking
-// This ensures consistency between dashboard display and exit signals
+// This ensures consistency between dashboard display and exit signals.
+// Once day-end-resolved (day_end_frozen_pnl set), the frozen value wins
+// regardless of in_session — the entry's outcome is already permanently
+// scored, so the display must stop drifting with the live/off-hours close.
 float live_pnl_pct = 0.0
 
-if pnl_direction == "BUY" and not na(pnl_entry_price)
+if not na(day_end_frozen_pnl)
+    live_pnl_pct := day_end_frozen_pnl
+else if pnl_direction == "BUY" and not na(pnl_entry_price)
     live_pnl_pct := ((close - pnl_entry_price) / pnl_entry_price) * 100
 else if pnl_direction == "SELL" and not na(pnl_entry_price)
     live_pnl_pct := ((pnl_entry_price - close) / pnl_entry_price) * 100
@@ -1630,31 +1652,44 @@ if signal_sell and showLabels
 //======================================================================
 // PROFIT/LOSS EXIT LABELS WITH ANCHOR-AWARE POSITIONING
 //======================================================================
-if signal_profit and enablePnL
-    // normal_target_reached and day_end_win_hit are mutually exclusive by
-    // construction (see DAY-END FORCED RESOLUTION), so checking day_end_win_hit
-    // directly tells us which path resolved this bar — correct whether the
-    // day-end path fired via the off-hours session_just_closed bar or the
-    // same-bar calendar-rollover fallback (where in_session stays true
-    // throughout, so "not in_session" would misidentify the path). Day-end:
-    // show the actual P&L and anchor the label back to the real last-bar-of-
-    // the-period (bar_index - 1 / close[1]), since the code itself runs one
-    // bar late. Normal: fixed target text, anchored to this bar as usual.
-    bool  is_day_end   = day_end_win_hit
-    string label_text  = is_day_end ? "PROFIT " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "PROFIT +" + str.tostring(pnlTarget, "#.#") + "%"
-    int   label_bar    = is_day_end ? bar_index - 1 : bar_index
-    float label_price  = is_day_end ? close[1] : anchor_line_price
-    string label_style = label.style_label_up
+// Shared by both blocks below. normal_target_reached/normal_stop_reached and
+// day_end_win_hit/day_end_loss_hit are mutually exclusive by construction
+// (see DAY-END FORCED RESOLUTION), so checking day_end_win_hit/loss_hit
+// directly tells us which path resolved this bar — correct whether the
+// day-end path fired via the off-hours session_just_closed bar or the
+// same-bar calendar-rollover fallback (where in_session stays true
+// throughout, so "not in_session" would misidentify the path).
+//
+// Day-end: anchor the label back to the real last-bar-of-the-period
+// (bar_index - 1 / close[1]), since the code itself runs one bar late.
+// Normal: anchored to this bar as usual.
+day_end_label_anchor(bool is_day_end) =>
+    int   lb = is_day_end ? bar_index - 1 : bar_index
+    float lp = is_day_end ? close[1] : anchor_line_price
+    [lb, lp]
 
+// A live signal_buy/signal_sell reversing the position takes precedence
+// (label points opposite the new direction); otherwise fall back to which
+// side pnl_exit_type says was closed — where PROFIT and LOSS point opposite
+// ways for the same closed direction, hence the is_profit flip.
+exit_label_style(bool is_profit) =>
+    style = label.style_label_up
     if signal_buy
-        label_style := label.style_label_down
+        style := label.style_label_down
     else if signal_sell
-        label_style := label.style_label_up
+        style := label.style_label_up
     else
         if pnl_exit_type == "BUY"
-            label_style := label.style_label_up
+            style := is_profit ? label.style_label_up : label.style_label_down
         else if pnl_exit_type == "SELL"
-            label_style := label.style_label_down
+            style := is_profit ? label.style_label_down : label.style_label_up
+    style
+
+if signal_profit and enablePnL
+    bool  is_day_end   = day_end_win_hit
+    string label_text  = is_day_end ? "PROFIT " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "PROFIT +" + str.tostring(pnlTarget, "#.#") + "%"
+    [label_bar, label_price] = day_end_label_anchor(is_day_end)
+    string label_style = exit_label_style(true)
 
     label.new(label_bar, label_price, label_text,
          yloc = yloc.price,
@@ -1664,23 +1699,10 @@ if signal_profit and enablePnL
          size = size.normal)
 
 if signal_loss and enablePnL
-    // See signal_profit above — day_end_loss_hit directly identifies which
-    // path resolved this bar and how the label is anchored.
     bool  is_day_end   = day_end_loss_hit
     string label_text  = is_day_end ? "LOSS " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "LOSS -" + str.tostring(pnlTarget, "#.#") + "%"
-    int   label_bar    = is_day_end ? bar_index - 1 : bar_index
-    float label_price  = is_day_end ? close[1] : anchor_line_price
-    string label_style = label.style_label_down
-
-    if signal_buy
-        label_style := label.style_label_down
-    else if signal_sell
-        label_style := label.style_label_up
-    else
-        if pnl_exit_type == "BUY"
-            label_style := label.style_label_down
-        else if pnl_exit_type == "SELL"
-            label_style := label.style_label_up
+    [label_bar, label_price] = day_end_label_anchor(is_day_end)
+    string label_style = exit_label_style(false)
 
     label.new(label_bar, label_price, label_text,
          yloc = yloc.price,
