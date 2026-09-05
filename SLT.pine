@@ -84,10 +84,11 @@ sigQuality = input.string("⭐ +", "Score Stars",
 grp_pnl = "💰 P&L Exit Signals"
 enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
      tooltip = "Show PROFIT/LOSS exit markers when price moves ±target % from entry. If a position " +
-               "is still open at the last bar of Trading Hours without having reached ±target, it's " +
-               "force-closed there instead — PROFIT if it's net positive, LOSS if net negative, using " +
-               "the actual % (not the target) — so no position (or its exit label) ever carries past " +
-               "your trading hours.")
+               "is still open when Trading Hours ends without having reached ±target, it's force-closed " +
+               "instead — PROFIT if it's net positive, LOSS if net negative, using the actual % (not the " +
+               "target). Detected on the first bar after hours, but the label/alert are placed back at " +
+               "the real last bar — so no position (or its exit label) ever carries past your trading " +
+               "hours.")
 pnlTarget = input.float(1.0, "P&L Target (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = grp_pnl,
      tooltip = "PROFIT/LOSS fires at ±this percent from entry. Default 1.0%.")
 
@@ -96,7 +97,10 @@ tradingHours = input.session("0930-1600:23456", "Trading Hours", group = grp_hou
      tooltip = "Session window signals are allowed to fire in. Applies to EVERY asset type, " +
                "including 24h futures/crypto — previously those traded with no hours restriction " +
                "at all, which is what let signals fire outside your actual trading hours. Uses the " +
-               "chart's exchange timezone. Default 09:30–16:00, Mon–Fri (US market hours).")
+               "chart's exchange timezone. Default 09:30–16:00, Mon–Fri (US market hours). Enter a " +
+               "single continuous range — a comma-separated multi-range session (e.g. a lunch break) " +
+               "is treated as multiple separate trading days: an open position gets force-resolved at " +
+               "each internal gap, not just at the actual end of day.")
 
 grp_vis = "📊 Dashboard & Visuals"
 showDash = input.bool(true, "Show Dashboard", group = grp_vis,
@@ -971,6 +975,19 @@ var bool has_previous_signal = false
 // asset type uniformly, including 24h futures/crypto — there is no more
 // per-profile on/off (previously FUTURES/CRYPTO resolved rth_auto = false
 // and traded with no hours restriction at all).
+// tradingHours is designed for a SINGLE continuous range. input.session also
+// accepts comma-separated multi-range strings (e.g. a lunch-break split like
+// "0930-1130,1300-1600:23456") — in_session correctly reports "inside any
+// sub-range" for such a string, but session_just_opened/session_just_closed
+// fire at EVERY sub-range boundary, not just the real start/end of the
+// trading day. That means the daily flatten/reset (below) and the day-end
+// forced P&L resolution (see DAY-END FORCED RESOLUTION) would trigger at each
+// internal gap too, prematurely force-scoring an open position at, e.g., the
+// lunch break rather than at the actual close. Not fixed here: distinguishing
+// "the last sub-range of today" from an internal gap isn't derivable from
+// in_session/prev_in_session alone (it would need to parse tradingHours
+// itself), and multi-range sessions are outside this script's documented use
+// (a single applied window). Keep tradingHours to one range.
 bool in_session       = not na(time(timeframe.period, tradingHours))
 bool prev_in_session   = not na(time(timeframe.period, tradingHours)[1])
 bool session_just_opened = in_session and not prev_in_session
@@ -1415,14 +1432,25 @@ if enableSuccessRate
     // opened it). Only push if the entry actually resolved (hit PROFIT or
     // LOSS); an entry reversed before hitting either is excluded from the
     // win-rate ratio entirely — it counts toward neither win nor loss.
+    // buy_entry_open/won/lost must be cleared here too (not just at the
+    // session_just_opened carryover reset below) — otherwise, if no further
+    // BUY reopens the slot before the next session boundary, the carryover
+    // reset finds these stale true flags and pushes this already-scored
+    // entry into buy_results a second time.
     if signal_sell and buy_entry_open
         if buy_won_this_entry or buy_lost_this_entry
             buy_results := add_result(buy_results, buy_won_this_entry, maxSignalsToTrack)
             record_module(mod_results, strat_id(buy_entry_strategy), true, buy_won_this_entry, maxSignalsToTrack)
+        buy_entry_open := false
+        buy_won_this_entry := false
+        buy_lost_this_entry := false
     if signal_buy and sell_entry_open
         if sell_won_this_entry or sell_lost_this_entry
             sell_results := add_result(sell_results, sell_won_this_entry, maxSignalsToTrack)
             record_module(mod_results, strat_id(sell_entry_strategy), false, sell_won_this_entry, maxSignalsToTrack)
+        sell_entry_open := false
+        sell_won_this_entry := false
+        sell_lost_this_entry := false
 
     // Open the new entry — stamp it with the module the router picked this
     // bar, and count it toward the dashboard's total-fired context stat
