@@ -124,7 +124,8 @@ grp_vis = "📊 Dashboard & Visuals"
 showDash = input.bool(true, "Show Dashboard", group = grp_vis,
      tooltip = "Bottom-right metrics table.")
 extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
-     tooltip = "Adds the per-component point breakdown, win-rate rows and diagnostic rows to the dashboard.")
+     tooltip = "Adds the per-component point breakdown plus the Volatility, ATR Fuel, Bars From Flip and " +
+               "Gate Details rows. The BUY/SELL win-rate + Trade Signal rows show regardless of this setting.")
 
 //======================================================================
 // FIXED BEHAVIOUR
@@ -140,7 +141,6 @@ bool   enableSuccessRate = true
 int    maxSignalsToTrack = 50
 bool   showSignalPnL     = true
 bool   showCircles       = true            // trend-flip circles always on
-bool   showBg            = true            // trend background always on
 
 // ORB strategy module — retired in the light build. Kept inert
 // (orbEnabled = false) so the router / dashboard / plot code that still
@@ -793,7 +793,7 @@ if is_bull
     else
         rsi_pts := 0
 else if is_bear
-    if rsiVal < 45 and not rsi_rising // High-conviction downside
+    if rsiVal < 40 and not rsi_rising // High-conviction downside — mirror of bull's >60 rising
         rsi_pts := 12
     else if rsiVal < 55 and rsiVal >= 40
         rsi_pts := 8
@@ -1687,8 +1687,10 @@ smaUpper = plot(anchorMode == "SMA" and smaBufferATR > 0 ? smaAnchor + sma_band 
 smaLower = plot(anchorMode == "SMA" and smaBufferATR > 0 ? smaAnchor - sma_band : na,
      "SMA Buffer Lower", color = color.new(color.gray, 60), style = plot.style_line, linewidth = 1)
 
+// Shade the SMA buffer band (SMA mode only) so the whipsaw-suppressing neutral
+// zone is visible; fully transparent in EMA Cross mode where the band isn't drawn.
 fill(smaUpper, smaLower,
-     color = showBg and anchorMode == "SMA" ? color.new(color.gray, 90) : color.new(color.white, 100))
+     color = anchorMode == "SMA" ? color.new(color.gray, 90) : color.new(color.white, 100))
 
 // SMA Flip Circles (only in SMA mode)
 plotshape(anchorMode == "SMA" and showCircles and trendUp ? smaAnchor : na,
