@@ -19,7 +19,6 @@ const int SQUEEZE_PENALTY = 30
 const int LIQUIDITY_PENALTY = 25
 
 // DASHBOARD
-const string DASH_WIDTH = "                                        "
 // Sized to leave headroom before the break guard for the variable-length
 // gate-details loop below. History: 28 -> 30 -> 32 -> 36 as the router phases
 // added optional ORB / VWAP Fade / per-module win-rate rows. The light build
@@ -27,6 +26,25 @@ const string DASH_WIDTH = "                                        "
 // 36 (only the Trend Pull per-module row draws); the constant is kept at 36
 // as slack for re-adding a module.
 const int DASHBOARD_MAX_ROWS = 36
+
+// Dashboard "fired" context stat — rolling window in TRADING SESSIONS (not
+// calendar days), so weekends/holidays don't shrink it. Mirrors the
+// rvolLookbackDays convention (session-counted, not raw-time-subtracted).
+const int FIRED_LOOKBACK_SESSIONS = 20
+
+// Trade-verdict row ("Trade Signal" on the dashboard) — turns the resolved
+// win rate for whichever direction fired last into a TRADE / CAUTION / SKIP
+// call. VERDICT_MIN_SAMPLE resolved entries are required before a verdict is
+// given at all (small samples default to WAIT). VERDICT_MIN_RESOLUTION is
+// the floor on resolved/fired — below it, most signals in that direction are
+// getting reversed before ever hitting target or stop, so the tracked win
+// rate is measured off too thin/self-selected a slice to trust, regardless
+// of how good it looks (forces SKIP). WILSON_Z=1.96 is the 95% confidence
+// z-score used to shrink the raw win rate toward 50% for a small sample
+// (Wilson score lower bound) before it's judged against the tier cutoffs.
+const int   VERDICT_MIN_SAMPLE     = 10
+const float VERDICT_MIN_RESOLUTION = 0.40
+const float WILSON_Z                 = 1.96
 
 //======================================================================
 // TYPES
@@ -383,6 +401,13 @@ var float session_low = na
 // futures), so no per-type branching is needed here. (This previously existed
 // as four if/else branches with identical bodies.)
 bool is_new_session = ta.change(time("D")) != 0 or na(session_high[1])
+
+// Running count of sessions seen so far (bar 0's session = 1). Used to build
+// a trading-session rolling window (e.g. the dashboard's fired-count stat)
+// without raw-time arithmetic, so weekend/holiday gaps don't distort it.
+var int session_seq = 0
+if is_new_session
+    session_seq += 1
 
 // Reset or update session range
 if is_new_session
@@ -1131,8 +1156,9 @@ if target_reached or stop_reached
 // PROFIT or LOSS is UNRESOLVED — it is not pushed into buy_results/
 // sell_results at all, so it counts toward neither the win nor the loss
 // side of the ratio. buy_signals_fired/sell_signals_fired separately count
-// every signal that ever fired (resolved or not) for dashboard context —
-// they are not used in the win-rate percentage itself.
+// every signal that fired (resolved or not) in the last FIRED_LOOKBACK_SESSIONS
+// trading sessions, for dashboard context — they are not used in the win-rate
+// percentage itself.
 //======================================================================
 // Separate tracking for BUY and SELL signals
 // Uses arrays to track last N signals (configurable via maxSignalsToTrack)
@@ -1154,10 +1180,23 @@ var bool buy_entry_open = false
 var bool sell_entry_open = false
 
 // Total signals fired (resolved or not) — dashboard-only context, not part
-// of the win-rate ratio. Counted at the moment each signal fires (open),
-// not at close, so an entry still open counts here immediately.
-var int buy_signals_fired = 0
-var int sell_signals_fired = 0
+// of the win-rate ratio. Counted at the moment each signal fires (open), not
+// at close, so an entry still open counts here immediately. Rolling window
+// over the last FIRED_LOOKBACK_SESSIONS trading sessions (not lifetime): each
+// array holds the session_seq of every fire still inside the window; entries
+// are pushed in increasing session_seq order (bars are processed in order),
+// so trimming stale ones off the front each bar is sufficient — no need to
+// scan the whole array.
+var array<int> buy_fire_sessions = array.new<int>()
+var array<int> sell_fire_sessions = array.new<int>()
+
+while array.size(buy_fire_sessions) > 0 and array.get(buy_fire_sessions, 0) <= session_seq - FIRED_LOOKBACK_SESSIONS
+    array.shift(buy_fire_sessions)
+while array.size(sell_fire_sessions) > 0 and array.get(sell_fire_sessions, 0) <= session_seq - FIRED_LOOKBACK_SESSIONS
+    array.shift(sell_fire_sessions)
+
+int buy_signals_fired = array.size(buy_fire_sessions)
+int sell_signals_fired = array.size(sell_fire_sessions)
 
 // Phase 4: per-module win-rate. The overall buy_results/sell_results above
 // stay module-blind; these mirror them split by the module that OPENED the
@@ -1218,6 +1257,55 @@ calc_win_rate(array<bool> arr, bool enabled) =>
                 wins += 1
     float rate = total > 0 ? (wins / total) * 100 : 0.0
     [wins, total, rate]
+
+// Wilson score lower bound (95% confidence, WILSON_Z) for a win rate
+// estimated from wins/total resolved trades. Shrinks the raw rate toward
+// 50% as total gets small, so a lucky 3/4 (75%) doesn't read the same as a
+// well-sampled 75/100 — used by trade_verdict() below instead of the raw
+// rate so the dashboard verdict isn't fooled by a thin sample. Caller must
+// ensure total > 0 (trade_verdict only calls this once VERDICT_MIN_SAMPLE
+// is met).
+wilson_lower_bound(int wins, int total) =>
+    float p    = wins / total
+    float z2   = WILSON_Z * WILSON_Z
+    float denom  = 1 + z2 / total
+    float center = p + z2 / (2 * total)
+    float margin = WILSON_Z * math.sqrt(p * (1 - p) / total + z2 / (4 * total * total))
+    (center - margin) / denom
+
+// Dashboard "Trade Signal" verdict for one direction's resolved stats.
+// - Fewer than VERDICT_MIN_SAMPLE resolved trades: not enough evidence yet
+//   (WAIT), regardless of how good the raw rate looks.
+// - resolved/fired below VERDICT_MIN_RESOLUTION: most signals in this
+//   direction are getting reversed before ever hitting target or stop, so
+//   the resolved sample is too thin/self-selected to trust (SKIP), even if
+//   its own win rate looks fine.
+// - Otherwise, judged on the Wilson-adjusted rate against the same 60/50
+//   tier cutoffs already used for the win-rate row colors: >=60% TRADE,
+//   >=50% CAUTION (thin edge), below SKIP.
+trade_verdict(int wins, int total, int fired, float target) =>
+    string verdict = "WAIT"
+    color  vcolor  = color.gray
+    if total < VERDICT_MIN_SAMPLE
+        verdict := "WAIT (" + str.tostring(total) + "/" + str.tostring(VERDICT_MIN_SAMPLE) + ")"
+    else
+        float resolution_rate = fired > 0 ? total / fired : 0.0
+        if resolution_rate < VERDICT_MIN_RESOLUTION
+            verdict := "SKIP (CHOPPY)"
+            vcolor := color.red
+        else
+            float wlb = wilson_lower_bound(wins, total)
+            float ev  = target * (2 * wlb - 1)
+            if wlb >= 0.60
+                verdict := "TRADE (" + str.tostring(ev, "#.##") + "%)"
+                vcolor := color.lime
+            else if wlb >= 0.50
+                verdict := "CAUTION (" + str.tostring(ev, "#.##") + "%)"
+                vcolor := color.yellow
+            else
+                verdict := "SKIP (" + str.tostring(ev, "#.##") + "%)"
+                vcolor := color.red
+    [verdict, vcolor]
 
 [totalWins_buy, totalTrades_buy, success_rate_buy] = calc_win_rate(buy_results, enableSuccessRate)
 [totalWins_sell, totalTrades_sell, success_rate_sell] = calc_win_rate(sell_results, enableSuccessRate)
@@ -1475,13 +1563,13 @@ if enableSuccessRate
         buy_won_this_entry := false
         buy_lost_this_entry := false
         buy_entry_strategy := active_strategy
-        buy_signals_fired += 1
+        array.push(buy_fire_sessions, session_seq)
     if signal_sell
         sell_entry_open := true
         sell_won_this_entry := false
         sell_lost_this_entry := false
         sell_entry_strategy := active_strategy
-        sell_signals_fired += 1
+        array.push(sell_fire_sessions, session_seq)
 
 //======================================================================
 // UPDATE SIGNAL P&L TRACKING (INDEPENDENT SYSTEM)
@@ -1495,6 +1583,16 @@ if signal_sell
     last_signal_price := close
     last_signal_type := "SELL"
     has_previous_signal := true
+
+// Dashboard "Trade Signal" verdict — tracks only the direction that fired
+// LAST (last_signal_type, just updated above), not both sides at once.
+// Placed after the last_signal_type updates (not up in SUCCESS RATE
+// TRACKING where totalWins_*/totalTrades_* are computed) so a signal firing
+// on THIS bar is picked up immediately rather than lagging a bar behind.
+int   verdict_wins  = last_signal_type == "BUY" ? totalWins_buy : totalWins_sell
+int   verdict_total = last_signal_type == "BUY" ? totalTrades_buy : totalTrades_sell
+int   verdict_fired = last_signal_type == "BUY" ? buy_signals_fired : sell_signals_fired
+[verdict_text, verdict_color] = trade_verdict(verdict_wins, verdict_total, verdict_fired, pnlTarget)
 
 //======================================================================
 // UPDATE P&L EXIT TRACKING
@@ -1747,12 +1845,13 @@ if showDash and barstate.islast
     // displaying last render's (now false) warning. Wipe every row first.
     table.clear(d, 0, 0, 1, DASHBOARD_MAX_ROWS - 1)
 
-    // Header
+    // Header — no trailing padding: the merged header cell's width already
+    // comes from the widest content in the rows below it, and padding text
+    // before centering just pushes the visible text left of true-center.
     string header_with_pnl = "SLT " + VERSION + " | PnL " + pnl_text
-    string fixed_header = header_with_pnl + str.substring(DASH_WIDTH, 0, math.max(0, 40 - str.length(header_with_pnl)))
 
-    table.cell(d, 0, 0, fixed_header, 
-        text_color = color.white, 
+    table.cell(d, 0, 0, header_with_pnl,
+        text_color = color.white,
         bgcolor = color.new(color.gray, 40),
         text_size = size.small,
         text_halign = text.align_center)
@@ -1801,38 +1900,30 @@ if showDash and barstate.islast
         table.cell(d, 1, row, orb_dash, text_color = color.gray, text_size = size.small)
         row += 1
 
-    // ATR Fuel
-    string fuel_status = ""
-    
-    // Simplified fuel status (removed early session detection)
-    if fuel_used > fuel_max
-        if is_high_velocity
-            fuel_status := "🔥 VELOCITY OVERRIDE (" + str.tostring(fuel_used, "#") + "%)"
-        else
-            fuel_status := "🔴 EXHAUSTED (" + str.tostring(fuel_used, "#") + "%)"
-    else if fuel_used > 75
-        fuel_status := "⚠️ HIGH (" + str.tostring(fuel_used, "#") + "%)"
-    else if fuel_used > 50
-        fuel_status := "📊 MODERATE (" + str.tostring(fuel_used, "#") + "%)"
-    else if fuel_used > 25
-        fuel_status := "✅ FRESH (" + str.tostring(fuel_used, "#") + "%)"
-    else
-        fuel_status := "💪 FULL FUEL (" + str.tostring(fuel_used, "#") + "%)"
-    
-    table.cell(d, 0, row, "ATR Fuel", 
-         text_color = color.white, 
-         text_halign = text.align_left, 
-         text_size = size.small)
-    table.cell(d, 1, row, fuel_status, 
-         text_color = color.white,
-         text_size = size.small)
-    row += 1
-    
     // Setup Score
     table.cell(d, 0, row, "Setup Score", text_color = color.white, text_halign = text.align_left, text_size = size.small)
     table.cell(d, 1, row, dashboard_quality + " (" + str.tostring(dashboard_score) + ")", text_color = color.white, text_size = size.small)
     row += 1
-    
+
+    // Trade Signal — verdict for whichever direction fired LAST
+    // (last_signal_type), computed in trade_verdict() up in UPDATE SIGNAL
+    // P&L TRACKING. "—" until any signal has fired at all. Gated on
+    // enableSuccessRate since the verdict is built from the same resolved
+    // win-rate stats (totalWins_*/totalTrades_*) as the BUY/SELL Win Rate
+    // rows below.
+    if enableSuccessRate
+        string trade_signal_display = has_previous_signal ? last_signal_type + " · " + verdict_text : "—"
+        color  trade_signal_color   = has_previous_signal ? verdict_color : color.gray
+
+        table.cell(d, 0, row, "Trade Signal",
+             text_color = color.white,
+             text_halign = text.align_left,
+             text_size = size.small)
+        table.cell(d, 1, row, trade_signal_display,
+             text_color = trade_signal_color,
+             text_size = size.small)
+        row += 1
+
     // Gates Display
     string gate_label = gateOn ? "Gates" : "Risks"
     string count_display = active_gate_count > 0 ? str.tostring(active_gate_count) + " ACTIVE" : "NO ACTIVE"
@@ -1851,8 +1942,9 @@ if showDash and barstate.islast
         row += 1
 
         // BUY Win Rate — % is wins/(wins+losses) among RESOLVED entries only
-        // (totalTrades_buy). buy_signals_fired is the separate all-time count
-        // of every BUY signal fired, resolved or not, shown for context.
+        // (totalTrades_buy). buy_signals_fired is the separate count of every
+        // BUY signal fired, resolved or not, in the last FIRED_LOOKBACK_SESSIONS
+        // trading sessions, shown for context.
         string buy_count_text = totalTrades_buy >= maxSignalsToTrack ?
                                  str.tostring(totalWins_buy) + "/" + str.tostring(totalTrades_buy) + " (max)" :
                                  str.tostring(totalWins_buy) + "/" + str.tostring(totalTrades_buy)
@@ -1874,8 +1966,9 @@ if showDash and barstate.islast
         row += 1
 
         // SELL Win Rate — % is wins/(wins+losses) among RESOLVED entries only
-        // (totalTrades_sell). sell_signals_fired is the separate all-time
-        // count of every SELL signal fired, resolved or not, shown for context.
+        // (totalTrades_sell). sell_signals_fired is the separate count of every
+        // SELL signal fired, resolved or not, in the last FIRED_LOOKBACK_SESSIONS
+        // trading sessions, shown for context.
         string sell_count_text = totalTrades_sell >= maxSignalsToTrack ?
                                  str.tostring(totalWins_sell) + "/" + str.tostring(totalTrades_sell) + " (max)" :
                                  str.tostring(totalWins_sell) + "/" + str.tostring(totalTrades_sell)
@@ -1951,11 +2044,41 @@ if showDash and barstate.islast
         string atr_info = "ATR(14): $" + str.tostring(atr_14, "#.##") + 
                          " | Range: $" + str.tostring(session_range, "#.##")
         
-        table.cell(d, 0, row, "Volatility", 
-             text_color = color.gray, 
-             text_halign = text.align_left, 
+        table.cell(d, 0, row, "Volatility",
+             text_color = color.gray,
+             text_halign = text.align_left,
              text_size = size.small)
         table.cell(d, 1, row, atr_info,
+             text_color = color.white,
+             text_size = size.small)
+        row += 1
+
+        // ATR Fuel — % of the daily ATR-14 already consumed by today's
+        // session range; feeds Gate 3 (see Gates row / Setup Score for its
+        // scored effect). Kept here as diagnostic-only context — it's the
+        // one place that still shows 🔥 VELOCITY OVERRIDE (Gate 3's penalty
+        // waived by is_high_velocity), which the Gates row alone can't
+        // distinguish from "no fuel exhaustion at all".
+        string fuel_status = ""
+        if fuel_used > fuel_max
+            if is_high_velocity
+                fuel_status := "🔥 VELOCITY OVERRIDE (" + str.tostring(fuel_used, "#") + "%)"
+            else
+                fuel_status := "🔴 EXHAUSTED (" + str.tostring(fuel_used, "#") + "%)"
+        else if fuel_used > 75
+            fuel_status := "⚠️ HIGH (" + str.tostring(fuel_used, "#") + "%)"
+        else if fuel_used > 50
+            fuel_status := "📊 MODERATE (" + str.tostring(fuel_used, "#") + "%)"
+        else if fuel_used > 25
+            fuel_status := "✅ FRESH (" + str.tostring(fuel_used, "#") + "%)"
+        else
+            fuel_status := "💪 FULL FUEL (" + str.tostring(fuel_used, "#") + "%)"
+
+        table.cell(d, 0, row, "ATR Fuel",
+             text_color = color.gray,
+             text_halign = text.align_left,
+             text_size = size.small)
+        table.cell(d, 1, row, fuel_status,
              text_color = color.white,
              text_size = size.small)
         row += 1
