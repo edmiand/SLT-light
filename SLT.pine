@@ -1304,23 +1304,22 @@ var bool sell_lost_this_entry = false
 var bool buy_entry_open = false
 var bool sell_entry_open = false
 
-// Front-trim each bucket to the session window every bar. Unconditional
-// front-trim (no full scan) is correct because session_seq is pushed in
-// non-decreasing order. Inlined per bucket (not a helper) — same proven
-// pattern the old fire-session trim used; a `while` inside a UDF is avoided.
+// Front-trim a session-seq bucket to the rolling window. Mutates `a` in
+// place — an array passed by reference is fair game inside a UDF (same as
+// record_module() below). One unconditional front-trim (no full scan) is
+// correct because session_seq is pushed in non-decreasing order, so any
+// stale entries are always a contiguous prefix.
+trim_window(array<int> a, int cutoff) =>
+    while array.size(a) > 0 and array.get(a, 0) <= cutoff
+        array.shift(a)
+
 int winrate_cutoff = session_seq - WINRATE_LOOKBACK_SESSIONS
-while array.size(buy_win_s)  > 0 and array.get(buy_win_s,  0) <= winrate_cutoff
-    array.shift(buy_win_s)
-while array.size(buy_loss_s) > 0 and array.get(buy_loss_s, 0) <= winrate_cutoff
-    array.shift(buy_loss_s)
-while array.size(buy_unr_s)  > 0 and array.get(buy_unr_s,  0) <= winrate_cutoff
-    array.shift(buy_unr_s)
-while array.size(sell_win_s)  > 0 and array.get(sell_win_s,  0) <= winrate_cutoff
-    array.shift(sell_win_s)
-while array.size(sell_loss_s) > 0 and array.get(sell_loss_s, 0) <= winrate_cutoff
-    array.shift(sell_loss_s)
-while array.size(sell_unr_s)  > 0 and array.get(sell_unr_s,  0) <= winrate_cutoff
-    array.shift(sell_unr_s)
+trim_window(buy_win_s,   winrate_cutoff)
+trim_window(buy_loss_s,  winrate_cutoff)
+trim_window(buy_unr_s,   winrate_cutoff)
+trim_window(sell_win_s,  winrate_cutoff)
+trim_window(sell_loss_s, winrate_cutoff)
+trim_window(sell_unr_s,  winrate_cutoff)
 
 int buy_w  = array.size(buy_win_s)
 int buy_l  = array.size(buy_loss_s)
