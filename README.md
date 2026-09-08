@@ -1,28 +1,44 @@
-# SLT
+# 📈 SLT
 
-An intraday trading indicator for TradingView (Pine Script v6).
+**An intraday trading indicator for TradingView (Pine Script v6).**
 
-SLT looks for moments where trend, momentum, volume and volatility line up, and
-marks them on the chart with **BUY** and **SELL** labels. A small dashboard in the
-corner shows the current setup quality, a plain trade call, and a running win rate
-for the signals it has printed.
+SLT hunts for the moments where trend, momentum, volume and volatility all line
+up — and marks them on the chart with **🟢 BUY** and **🔴 SELL** labels. A compact
+dashboard in the corner shows the current setup quality, a plain-language trade
+call, and a running win rate for the signals it has printed.
 
-It is built for **intraday trading** — short holds, one position at a time, flat
-by the end of the session. It adapts on its own to whatever you load it on
-(stocks, ETFs, futures, crypto, index CFDs), so there is nothing to set up per
-symbol.
+## ✨ What it does
 
-## Settings
+- 🎯 **Confluence scoring** — five components (EMA cascade, VWAP, volume, ADX,
+  momentum) scored and summed into a single setup rating
+- 🛡️ **Risk gates** — squeeze, over-extension, spent volatility and thin
+  liquidity all dock the score
+- 🧭 **Plain trade call** — a TRADE / CAUTION / SKIP / WAIT verdict, sample-size
+  aware, so you don't have to read the raw numbers
+- 📊 **Live dashboard** — setup score, gates, win rate and P&L, bottom-right
+- 🔔 **Alerts** — `BUY`, `SELL`, `PROFIT`, `LOSS`
 
-The panel is deliberately small: the trend engine, how selective the signal
-labels are, an optional fixed profit/loss target, a trading-hours window, and
-dashboard visibility. Everything else tunes itself.
+## ⚡ Built for intraday
 
-## Alerts
+Short holds, one position at a time, flat by the end of the session. SLT adapts
+on its own to whatever you load it on — 📊 stocks, ETFs, ⚡ futures, 🪙 crypto,
+🏦 index CFDs — so there is nothing to set up per symbol.
 
-BUY, SELL, PROFIT, LOSS.
+## ⚙️ Settings
 
-## Disclaimer
+The panel is deliberately small:
+
+| Setting | What it controls |
+|---|---|
+| 🧠 **Signal Anchor** | the trend engine (EMA Cross or SMA) |
+| ⭐ **Score Stars** | how selective the BUY/SELL labels are |
+| 💰 **P&L Exit** | an optional fixed profit/loss target |
+| 🕒 **Trading Hours** | the session window signals may fire in |
+| 🖥️ **Dashboard & Visuals** | dashboard visibility |
+
+Everything else tunes itself.
+
+## ⚠️ Disclaimer
 
 For educational purposes only. Not financial advice, and no trading result is
 guaranteed. Trade at your own risk.
