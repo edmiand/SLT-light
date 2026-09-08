@@ -334,13 +334,21 @@ int   maxBarsFromFlip  = anchorMode == "SMA" ? 0 : len10
 // (SPY / QQQ / XIC) that tracks it nearly tick-for-tick in RTH, so the full
 // engine stays alive. Every other symbol (stocks / ETFs / futures / forex)
 // is untouched — proxy usage is gated on `syminfo.type == "index"` AND the
-// chart never having shown positive volume.
+// chart not carrying real volume.
 //
-// `chart_has_volume` latches true the first time real volume is seen (an
-// index feed never does; a real symbol does on bar 0-1). Kept as a var
-// latch rather than `ta.sma(volume,20) > 0` so it can't flip mid-history.
+// `chart_has_volume` latches true only once a SUSTAINED majority of the last
+// 100 bars carried real volume — not on the first nonzero bar. A genuine
+// equity/ETF/futures feed sits near 1.0; a cash index at 0.0 — but some
+// aggregated index feeds print a sporadic nonzero tick-count on scattered
+// bars, and a single such bar must NOT flip this and silently disable the
+// proxy for the whole chart (the original one-bar var-latch did exactly
+// that). Monotonic (never un-latches), so no warm-up flicker. Fixed 100-bar
+// window — a data-property probe, not a market-calibrated lookback, so not
+// tf-scaled. Until it fills, chart_has_volume stays false (proxy-eligible),
+// which only matters for index-typed symbols anyway (syminfo.type gate).
 var bool chart_has_volume = false
-if not na(volume) and volume > 0
+float vol_bar_frac = ta.sma((not na(volume) and volume > 0) ? 1.0 : 0.0, 100)
+if not na(vol_bar_frac) and vol_bar_frac > 0.5
     chart_has_volume := true
 
 // Proxy ETF by index family — recognized S&P 500 / Nasdaq / S&P-TSX symbols
@@ -527,8 +535,14 @@ if tod_hist_sessions > 0
     for s = 0 to tod_hist_sessions - 1
         TodSession tod_sess = array.get(tod_vol_history, s)
         if tod_slot_idx < array.size(tod_sess.vols)
-            tod_vol_sum += array.get(tod_sess.vols, tod_slot_idx)
-            tod_vol_count += 1
+            float tod_slot_v = array.get(tod_sess.vols, tod_slot_idx)
+            // Skip na slots — a volume-less bar (vol_eff na when a proxy-less
+            // index falls through, or a rare proxy per-bar gap) is pushed as
+            // na at line ~520; unguarded, one na would poison this slot's
+            // average for every session it stays in tod_vol_history.
+            if not na(tod_slot_v)
+                tod_vol_sum += tod_slot_v
+                tod_vol_count += 1
 
 // Require at least 3 historical sessions at this slot for a meaningful average
 bool tod_data_sufficient = tod_vol_count >= 3
@@ -553,8 +567,12 @@ float vol_ma_eff = use_proxy ? proxy_vol_ma_raw : vol_ma20
 // above 1.0 would silently pin a permanent -25 liquidity penalty on every
 // volume-less index that also has no working proxy. If you tune that value, add
 // an explicit volume-availability check here instead of relying on this fallback.
-float rel_vol_rolling = vol_ma_eff > 0 ? vol_eff / vol_ma_eff : 1.0
-float rel_vol_tod = tod_data_sufficient and not na(tod_vol_avg) and tod_vol_avg > 0 ? vol_eff / tod_vol_avg : na
+// `not na(vol_eff)` guard: with use_proxy true, vol_ma_eff (proxy vol SMA) can
+// be valid while proxy_vol_raw comes back na on a rare per-bar gap — without
+// the guard rel_vol_rolling would be na (Component 3 -> 0) instead of the
+// intended neutral 1.0.
+float rel_vol_rolling = not na(vol_eff) and vol_ma_eff > 0 ? vol_eff / vol_ma_eff : 1.0
+float rel_vol_tod = tod_data_sufficient and not na(tod_vol_avg) and tod_vol_avg > 0 and not na(vol_eff) ? vol_eff / tod_vol_avg : na
 
 bool tod_rvol_active = rvolMode == "Time-of-Day" and not na(rel_vol_tod)
 rel_vol = tod_rvol_active ? rel_vol_tod : rel_vol_rolling
@@ -707,17 +725,28 @@ else if is_bear
 // Component 2 scores "how far is price from a fair-value line". That line is:
 //   chart has volume            -> the real session VWAP (unchanged)
 //   volume-less index + proxy    -> the proxy's VWAP, rescaled to index units
-//   neither (no proxy)           -> a session TWAP: running mean of hlc3 since
-//                                   the session open, a volume-free stand-in.
+//   neither (no proxy)           -> a session TWAP: running mean of hlc3 over
+//                                   the current RTH session, a volume-free
+//                                   stand-in.
 // `vwap` is reassigned once, here, so the ~12 downstream references in
 // Component 2 (and the inert ORB block) need no change.
+//
+// TWAP is anchored to the tradingHours RTH window, NOT is_new_session — a
+// 24h index CFD rolling the calendar day at exchange-midnight would
+// otherwise average ~9h of thin overnight bars into the fair-value line
+// before the cash open. Uses a local time() call because in_session /
+// session_just_opened aren't defined until further below.
+bool  twap_in_sess = not na(time(timeframe.period, tradingHours))
+var bool  twap_prev_in_sess = false
 var float twap_cum = na
 var float twap_n   = na
-if is_new_session
+if twap_in_sess and not twap_prev_in_sess
     twap_cum := 0.0
     twap_n   := 0.0
-twap_cum := nz(twap_cum) + hlc3
-twap_n   := nz(twap_n) + 1
+twap_prev_in_sess := twap_in_sess
+if twap_in_sess
+    twap_cum := nz(twap_cum) + hlc3
+    twap_n   := nz(twap_n) + 1
 float session_twap = twap_n > 0 ? twap_cum / twap_n : close
 
 // Non-index volume-less feeds (e.g. forex) are deliberately left as-is
