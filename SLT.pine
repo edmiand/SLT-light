@@ -127,16 +127,9 @@ extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
      tooltip = "Adds the per-component point breakdown plus the Volatility, ATR Fuel, Bars From Flip and " +
                "Gate Details rows. The BUY/SELL win-rate + Trade Signal rows show regardless of this setting.")
 
-grp_proxy = "🧩 Index Data Proxy"
-proxyOverride = input.string("Auto", "Volume / VWAP Proxy", group = grp_proxy,
-     tooltip = "Cash indices (SPX, NASDAQ Composite, S&P/TSX, ...) usually report no volume, which " +
-               "silently disables the VWAP and Volume scoring components. When the chart symbol is a " +
-               "volume-less index, this borrows VWAP + relative-volume from a liquid ETF that tracks it " +
-               "nearly tick-for-tick during regular hours.\n\n" +
-               "Auto: QQQ for Nasdaq symbols, XIC for S&P/TSX symbols, SPY for everything else.\n" +
-               "Override: type an exchange-qualified ticker (e.g. AMEX:SPY, NASDAQ:QQQ, TSX:XIC).\n\n" +
-               "Has no effect on any symbol that already carries its own volume (stocks, ETFs, futures) " +
-               "or on non-index symbols such as forex.")
+// (No index-proxy input — the ETF used to source VWAP/volume for a
+// volume-less cash index is auto-picked by symbol family in the INDEX DATA
+// PROXY block below. Light build: to hand-pick one, edit that chain.)
 
 //======================================================================
 // FIXED BEHAVIOUR
@@ -350,12 +343,19 @@ var bool chart_has_volume = false
 if not na(volume) and volume > 0
     chart_has_volume := true
 
-// Auto proxy by index family; a non-"Auto" override string wins outright.
+// Proxy ETF by index family — recognized S&P 500 / Nasdaq / S&P-TSX symbols
+// map to SPY / QQQ / XIC. An index the map does NOT recognize (DAX, FTSE,
+// Nikkei, ...) is left to the session-TWAP substitute instead of being
+// scored off an unrelated ETF (`proxy_family_known` gates `use_proxy`).
+// This is deliberately not a settings-panel input; to hand-pick a proxy
+// (a different TSX ETF, a symbol you actually have data for, ...) edit
+// this chain.
 string sym_up     = str.upper(syminfo.ticker)
 bool   sym_is_ndx = str.contains(sym_up, "NDX") or str.contains(sym_up, "IXIC") or str.contains(sym_up, "NDQ") or str.contains(sym_up, "NAS100") or str.contains(sym_up, "US100") or str.contains(sym_up, "USTEC")
 bool   sym_is_tsx = str.contains(sym_up, "TSX") or str.contains(sym_up, "TX60") or str.contains(sym_up, "SPTSX")
-string proxy_ticker = proxyOverride != "Auto" and str.length(proxyOverride) > 0 ? proxyOverride :
-     (sym_is_ndx ? "NASDAQ:QQQ" : (sym_is_tsx ? "TSX:XIC" : "AMEX:SPY"))
+bool   sym_is_spx = str.contains(sym_up, "SPX") or str.contains(sym_up, "SP500") or str.contains(sym_up, "US500") or str.contains(sym_up, "GSPC")
+bool   proxy_family_known = sym_is_ndx or sym_is_tsx or sym_is_spx
+string proxy_ticker = sym_is_ndx ? "NASDAQ:QQQ" : (sym_is_tsx ? "TSX:XIC" : "AMEX:SPY")
 
 // One security call: proxy session VWAP, proxy close (to rescale VWAP into
 // index price units), proxy bar volume, proxy 20-bar volume SMA. lookahead
@@ -368,7 +368,7 @@ string proxy_ticker = proxyOverride != "Auto" and str.length(proxyOverride) > 0 
 bool proxy_eligible = syminfo.type == "index" and not chart_has_volume
 bool proxy_ok       = not na(proxy_vol_ma_raw) and proxy_vol_ma_raw > 0 and
      not na(proxy_vwap_raw) and not na(proxy_close_raw) and proxy_close_raw > 0
-bool use_proxy      = proxy_eligible and proxy_ok
+bool use_proxy      = proxy_eligible and proxy_family_known and proxy_ok
 
 // Proxy VWAP rescaled to the index's own price units: same fractional
 // deviation from VWAP the proxy shows, expressed at index scale, so
@@ -1963,11 +1963,11 @@ if showDash and barstate.islast
     table.cell(d, 1, row, trend_cell, text_color = trend_color, text_size = size.small)
     row += 1
     
-    // Profile Name (+ index-proxy status when a volume-less index is
-    // borrowing an ETF's VWAP/volume, or a warning when it can't).
+    // Profile Name (+ index-proxy status: which ETF is sourcing VWAP/volume
+    // for a volume-less index, or a note that it fell back to session TWAP).
     string profile_cell = profile_name +
          (use_proxy ? "  ·  " + proxy_ticker + " data" :
-          proxy_eligible ? "  ·  ⚠️ no volume / no proxy" : "")
+          proxy_eligible ? "  ·  ⚠️ volume-less → TWAP" : "")
     color profile_color = proxy_eligible and not use_proxy ? color.orange : color.white
     table.cell(d, 0, row, "Profile", text_color = color.white, text_halign = text.align_left, text_size = size.small)
     table.cell(d, 1, row, profile_cell, text_color = profile_color, text_size = size.small)
