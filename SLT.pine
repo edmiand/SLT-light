@@ -27,10 +27,13 @@ const int LIQUIDITY_PENALTY = 25
 // as slack for re-adding a module.
 const int DASHBOARD_MAX_ROWS = 36
 
-// Dashboard "fired" context stat — rolling window in TRADING SESSIONS (not
-// calendar days), so weekends/holidays don't shrink it. Mirrors the
-// rvolLookbackDays convention (session-counted, not raw-time-subtracted).
-const int FIRED_LOOKBACK_SESSIONS = 20
+// Win-rate window — every closed BUY/SELL trade is bucketed W (hit PROFIT) /
+// L (hit LOSS) / U (reversed same-day, never hit either) and kept for this
+// many TRADING SESSIONS (not calendar days, so weekends/holidays don't
+// shrink it — mirrors the rvolLookbackDays convention). Both the win-rate %
+// and the "fired" total the Trade Signal verdict reads come from this one
+// window, so they compose: fired = W + L + U, rate = W / (W + L).
+const int WINRATE_LOOKBACK_SESSIONS = 15
 
 // Trade-verdict row ("Trade Signal" on the dashboard) — turns the resolved
 // win rate for whichever direction fired last into a TRADE / CAUTION / SKIP
@@ -142,7 +145,9 @@ bool   gateOn            = true            // risk gates always enforced
 string rvolMode          = "Time-of-Day"  // auto-falls back to 20-bar on thin history
 int    rvolLookbackDays  = 10
 bool   enableSuccessRate = true
-int    maxSignalsToTrack = 50
+int    maxSignalsToTrack = 50            // FIFO cap for the per-module win-rate arrays only
+                                        // (mod_results); the overall BUY/SELL win rate is
+                                        // session-windowed — see WINRATE_LOOKBACK_SESSIONS
 bool   showSignalPnL     = true
 bool   showCircles       = true            // trend-flip circles always on
 
@@ -281,10 +286,10 @@ else
 // adx_min, ext_scale, fuel_max, rvol tiers) — these were tuned against
 // 2-min bar noise/volatility characteristics and have no comparable
 // scaling law; changing interval still means re-validating those. Also
-// left alone: rvolLookbackDays / maxSignalsToTrack (session/signal
-// counts, not bar-lookback windows) and the 2-3 bar ta.rising() momentum
-// checks (ADX/RSI) — at that length, scaling either collapses to a
-// meaningless 1-bar check or adds complexity for no calibration benefit.
+// left alone: rvolLookbackDays / maxSignalsToTrack / WINRATE_LOOKBACK_SESSIONS
+// (session/signal counts, not bar-lookback windows) and the 2-3 bar
+// ta.rising() momentum checks (ADX/RSI) — at that length, scaling either
+// collapses to a meaningless 1-bar check or adds complexity for no benefit.
 const int BASE_TF_SECONDS = 120  // 2-minute reference chart
 float tf_scale = timeframe.in_seconds() > 0 ? BASE_TF_SECONDS / timeframe.in_seconds() : 1.0
 
@@ -1267,27 +1272,29 @@ if target_reached or stop_reached
     // Live P&L continues until reset conditions below
 
 //======================================================================
-// SUCCESS RATE TRACKING (ROLLING WINDOW)
-// Every BUY/SELL signal is scored when the opposite signal closes it, but
-// ONLY if it actually resolved: Win if PROFIT fired at any point during the
-// entry, Loss if LOSS fired. An entry that gets reversed before ever hitting
-// PROFIT or LOSS is UNRESOLVED — it is not pushed into buy_results/
-// sell_results at all, so it counts toward neither the win nor the loss
-// side of the ratio. buy_signals_fired/sell_signals_fired separately count
-// every signal that fired (resolved or not) in the last FIRED_LOOKBACK_SESSIONS
-// trading sessions, for dashboard context — they are not used in the win-rate
-// percentage itself.
+// SUCCESS RATE TRACKING (ROLLING WINDOW — LAST WINRATE_LOOKBACK_SESSIONS)
+// Every BUY/SELL trade, once it CLOSES (the opposite signal fires, or the
+// RTH session-open carryover), is bucketed into exactly one of:
+//   W  — PROFIT (target_reached) fired while it was open
+//   L  — LOSS   (stop_reached)   fired while it was open
+//   U  — neither: reversed on the same trading day before hitting
+//        +/-pnlTarget. Since day-end forced resolution that's the ONLY way
+//        to stay unresolved. Not "excluded" any more — U is its own bucket.
+// Each bucket is a var array<int> of the session_seq at CLOSE time, trimmed
+// to the trailing WINRATE_LOOKBACK_SESSIONS every bar. Dashboard shows
+// W/L/U directly; win rate = W/(W+L); the Trade Signal verdict's "fired" is
+// W+L+U — every number comes from this one window, so they compose.
 //======================================================================
-// Separate tracking for BUY and SELL signals
-// Uses arrays to track last N signals (configurable via maxSignalsToTrack)
+var array<int> buy_win_s  = array.new<int>()
+var array<int> buy_loss_s = array.new<int>()
+var array<int> buy_unr_s  = array.new<int>()
+var array<int> sell_win_s  = array.new<int>()
+var array<int> sell_loss_s = array.new<int>()
+var array<int> sell_unr_s  = array.new<int>()
 
-var array<bool> buy_results = array.new<bool>()   // true=Win (hit PROFIT), false=Loss — resolved entries only
-var array<bool> sell_results = array.new<bool>()  // true=Win (hit PROFIT), false=Loss — resolved entries only
-
-// An entry's outcome isn't known until it closes (the next opposite-direction
-// signal, or an RTH session-open carryover close below), so each entry's
-// won/lost flags accumulate PROFIT/LOSS hits and are read/reset when it
-// closes. At most one of the two is ever true per entry: target_reached and
+// An entry's outcome isn't known until it closes, so these var flags
+// accumulate PROFIT/LOSS hits during the entry and are read + reset when it
+// closes. At most one of won/lost is ever true per entry: target_reached and
 // stop_reached are mutually exclusive within a single entry (pnl_exit_fired
 // latches after the first of the two fires).
 var bool buy_won_this_entry = false
@@ -1297,29 +1304,39 @@ var bool sell_lost_this_entry = false
 var bool buy_entry_open = false
 var bool sell_entry_open = false
 
-// Total signals fired (resolved or not) — dashboard-only context, not part
-// of the win-rate ratio. Counted at the moment each signal fires (open), not
-// at close, so an entry still open counts here immediately. Rolling window
-// over the last FIRED_LOOKBACK_SESSIONS trading sessions (not lifetime): each
-// array holds the session_seq of every fire still inside the window; entries
-// are pushed in increasing session_seq order (bars are processed in order),
-// so trimming stale ones off the front each bar is sufficient — no need to
-// scan the whole array.
-var array<int> buy_fire_sessions = array.new<int>()
-var array<int> sell_fire_sessions = array.new<int>()
+// Front-trim each bucket to the session window every bar. Unconditional
+// front-trim (no full scan) is correct because session_seq is pushed in
+// non-decreasing order. Inlined per bucket (not a helper) — same proven
+// pattern the old fire-session trim used; a `while` inside a UDF is avoided.
+int winrate_cutoff = session_seq - WINRATE_LOOKBACK_SESSIONS
+while array.size(buy_win_s)  > 0 and array.get(buy_win_s,  0) <= winrate_cutoff
+    array.shift(buy_win_s)
+while array.size(buy_loss_s) > 0 and array.get(buy_loss_s, 0) <= winrate_cutoff
+    array.shift(buy_loss_s)
+while array.size(buy_unr_s)  > 0 and array.get(buy_unr_s,  0) <= winrate_cutoff
+    array.shift(buy_unr_s)
+while array.size(sell_win_s)  > 0 and array.get(sell_win_s,  0) <= winrate_cutoff
+    array.shift(sell_win_s)
+while array.size(sell_loss_s) > 0 and array.get(sell_loss_s, 0) <= winrate_cutoff
+    array.shift(sell_loss_s)
+while array.size(sell_unr_s)  > 0 and array.get(sell_unr_s,  0) <= winrate_cutoff
+    array.shift(sell_unr_s)
 
-while array.size(buy_fire_sessions) > 0 and array.get(buy_fire_sessions, 0) <= session_seq - FIRED_LOOKBACK_SESSIONS
-    array.shift(buy_fire_sessions)
-while array.size(sell_fire_sessions) > 0 and array.get(sell_fire_sessions, 0) <= session_seq - FIRED_LOOKBACK_SESSIONS
-    array.shift(sell_fire_sessions)
+int buy_w  = array.size(buy_win_s)
+int buy_l  = array.size(buy_loss_s)
+int buy_u  = array.size(buy_unr_s)
+int sell_w = array.size(sell_win_s)
+int sell_l = array.size(sell_loss_s)
+int sell_u = array.size(sell_unr_s)
 
-int buy_signals_fired = array.size(buy_fire_sessions)
-int sell_signals_fired = array.size(sell_fire_sessions)
-
-// Phase 4: per-module win-rate. The overall buy_results/sell_results above
-// stay module-blind; these mirror them split by the module that OPENED the
-// entry. *_entry_strategy is stamped with active_strategy when the entry
-// opens (see UPDATE SUCCESS RATE TRACKING) and read back at every close site.
+// Phase 4: per-module win-rate. The overall W/L/U buckets above stay
+// module-blind; these mirror the W/L side split by the module that OPENED
+// the entry (U is not tracked per-module). NOTE: mod_results is still
+// bool-array + FIFO-capped at maxSignalsToTrack (signal count), NOT
+// session-windowed like the overall buckets — it's dead in the light build
+// (multi_module = orbEnabled = false); reconcile the windowing if a second
+// module goes live. *_entry_strategy is stamped with active_strategy when
+// the entry opens (see UPDATE SUCCESS RATE TRACKING), read back at close.
 var array<ModResults> mod_results = array.new<ModResults>()
 if array.size(mod_results) == 0
     array.push(mod_results, ModResults.new(array.new<bool>(), array.new<bool>()))  // 0 Trend Pullback
@@ -1331,13 +1348,14 @@ var string sell_entry_strategy = "Trend Pullback"
 
 strat_id(string s) => s == "ORB" ? 1 : (s == "VWAP Fade" ? 2 : 0)
 
-// Helper function to add result to array with max limit
-add_result(array<bool> arr, bool is_win, int max_size) =>
-    array.push(arr, is_win)
-    // Remove oldest if exceeds limit
-    if array.size(arr) > max_size
-        array.shift(arr)
-    arr
+// [wins, total, rate%] for the overall BUY/SELL win rate, straight from the
+// session-windowed W and L bucket sizes (total = W + L, the resolved count).
+// calc_win_rate (below) still serves the bool-array per-module rows.
+winrate_stats(int wins, int losses, bool enabled) =>
+    int w = enabled ? wins : 0
+    int t = enabled ? wins + losses : 0
+    float rate = t > 0 ? (w / t) * 100 : 0.0
+    [w, t, rate]
 
 // Push one closed-entry result into the per-module store (mutates the UDT's
 // inner array in place — reference type, so no reassignment needed).
@@ -1391,13 +1409,15 @@ wilson_lower_bound(int wins, int total) =>
     float margin = WILSON_Z * math.sqrt(p * (1 - p) / total + z2 / (4 * total * total))
     (center - margin) / denom
 
-// Dashboard "Trade Signal" verdict for one direction's resolved stats.
+// Dashboard "Trade Signal" verdict for one direction's stats. total = W+L
+// (resolved), fired = W+L+U — same session window, so resolution_rate =
+// total/fired is a clean [0,1] ratio.
 // - Fewer than VERDICT_MIN_SAMPLE resolved trades: not enough evidence yet
 //   (WAIT), regardless of how good the raw rate looks.
-// - resolved/fired below VERDICT_MIN_RESOLUTION: most signals in this
-//   direction are getting reversed before ever hitting target or stop, so
-//   the resolved sample is too thin/self-selected to trust (SKIP), even if
-//   its own win rate looks fine.
+// - resolution_rate below VERDICT_MIN_RESOLUTION: most signals in this
+//   direction are getting reversed (U) before ever hitting target or stop,
+//   so the resolved sample is too thin/self-selected to trust (SKIP), even
+//   if its own win rate looks fine.
 // - Otherwise, judged on the Wilson-adjusted rate against the same 60/50
 //   tier cutoffs already used for the win-rate row colors: >=60% TRADE,
 //   >=50% CAUTION (thin edge), below SKIP.
@@ -1425,8 +1445,8 @@ trade_verdict(int wins, int total, int fired, float target) =>
                 vcolor := color.red
     [verdict, vcolor]
 
-[totalWins_buy, totalTrades_buy, success_rate_buy] = calc_win_rate(buy_results, enableSuccessRate)
-[totalWins_sell, totalTrades_sell, success_rate_sell] = calc_win_rate(sell_results, enableSuccessRate)
+[totalWins_buy, totalTrades_buy, success_rate_buy] = winrate_stats(buy_w, buy_l, enableSuccessRate)
+[totalWins_sell, totalTrades_sell, success_rate_sell] = winrate_stats(sell_w, sell_l, enableSuccessRate)
 
 //======================================================================
 // SIGNAL GENERATION (NON-REPAINTING)
@@ -1446,27 +1466,35 @@ var bool s_fired = false
 //
 // Reset fired flags at session open so first RTH bar fires without overnight carryover.
 // An entry still open from the prior session (never closed by an opposite
-// signal) needs to be closed out here first, same as a normal opposite-signal
-// close would — otherwise it would stay "open" forever once b_fired/s_fired
-// unblock a fresh same-direction signal. It only gets PUSHED into the
-// win-rate arrays if it actually resolved (hit PROFIT or LOSS); an entry
-// still unresolved at the session boundary is correctly excluded, same as
-// any other unresolved close.
+// signal) is closed out here first, same as a normal opposite-signal close —
+// otherwise it would stay "open" forever once b_fired/s_fired unblock a
+// fresh same-direction signal. It's bucketed W/L/U by outcome (stamped at
+// this session_seq), same as any close.
 if session_just_opened
     b_fired := false
     s_fired := false
     if enableSuccessRate
         if buy_entry_open
-            if buy_won_this_entry or buy_lost_this_entry
-                buy_results := add_result(buy_results, buy_won_this_entry, maxSignalsToTrack)
-                record_module(mod_results, strat_id(buy_entry_strategy), true, buy_won_this_entry, maxSignalsToTrack)
+            if buy_won_this_entry
+                array.push(buy_win_s, session_seq)
+                record_module(mod_results, strat_id(buy_entry_strategy), true, true, maxSignalsToTrack)
+            else if buy_lost_this_entry
+                array.push(buy_loss_s, session_seq)
+                record_module(mod_results, strat_id(buy_entry_strategy), true, false, maxSignalsToTrack)
+            else
+                array.push(buy_unr_s, session_seq)
             buy_entry_open := false
             buy_won_this_entry := false
             buy_lost_this_entry := false
         if sell_entry_open
-            if sell_won_this_entry or sell_lost_this_entry
-                sell_results := add_result(sell_results, sell_won_this_entry, maxSignalsToTrack)
-                record_module(mod_results, strat_id(sell_entry_strategy), false, sell_won_this_entry, maxSignalsToTrack)
+            if sell_won_this_entry
+                array.push(sell_win_s, session_seq)
+                record_module(mod_results, strat_id(sell_entry_strategy), false, true, maxSignalsToTrack)
+            else if sell_lost_this_entry
+                array.push(sell_loss_s, session_seq)
+                record_module(mod_results, strat_id(sell_entry_strategy), false, false, maxSignalsToTrack)
+            else
+                array.push(sell_unr_s, session_seq)
             sell_entry_open := false
             sell_won_this_entry := false
             sell_lost_this_entry := false
@@ -1629,9 +1657,9 @@ if showSignalPnL and has_previous_signal and not na(last_signal_price)
 //======================================================================
 // UPDATE SUCCESS RATE TRACKING (ROLLING WINDOW)
 //======================================================================
-// add_result() and the buy/sell won/open state are declared earlier
-// (alongside buy_results/sell_results) so the RTH session-open reset can
-// also close out a carried-over entry before this section runs.
+// The W/L/U session buckets and the buy/sell won/open state are declared
+// earlier (SUCCESS RATE TRACKING) so the RTH session-open reset can also
+// close out a carried-over entry before this section runs.
 
 // Reads target_reached/stop_reached (not signal_profit/signal_loss) so
 // win-rate stays correct when the PROFIT/LOSS display toggle (enablePnL) is
@@ -1648,46 +1676,52 @@ if enableSuccessRate
     if stop_reached and pnl_direction == "SELL"
         sell_lost_this_entry := true
 
-    // The opposite signal closes the prior entry — score it now, into both
-    // the overall array and the per-module store (keyed by the module that
-    // opened it). Only push if the entry actually resolved (hit PROFIT or
-    // LOSS); an entry reversed before hitting either is excluded from the
-    // win-rate ratio entirely — it counts toward neither win nor loss.
+    // The opposite signal closes the prior entry — bucket it now (W/L into
+    // the overall window AND the per-module store keyed by the opening
+    // module; U into the overall window only — mod_results stays W/L). Every
+    // closed entry lands in exactly one bucket, stamped at this session_seq.
     // buy_entry_open/won/lost must be cleared here too (not just at the
-    // session_just_opened carryover reset below) — otherwise, if no further
-    // BUY reopens the slot before the next session boundary, the carryover
-    // reset finds these stale true flags and pushes this already-scored
-    // entry into buy_results a second time.
+    // session_just_opened carryover reset) — otherwise, if no further BUY
+    // reopens the slot before the next session boundary, the carryover reset
+    // finds these stale true flags and buckets this entry a second time.
     if signal_sell and buy_entry_open
-        if buy_won_this_entry or buy_lost_this_entry
-            buy_results := add_result(buy_results, buy_won_this_entry, maxSignalsToTrack)
-            record_module(mod_results, strat_id(buy_entry_strategy), true, buy_won_this_entry, maxSignalsToTrack)
+        if buy_won_this_entry
+            array.push(buy_win_s, session_seq)
+            record_module(mod_results, strat_id(buy_entry_strategy), true, true, maxSignalsToTrack)
+        else if buy_lost_this_entry
+            array.push(buy_loss_s, session_seq)
+            record_module(mod_results, strat_id(buy_entry_strategy), true, false, maxSignalsToTrack)
+        else
+            array.push(buy_unr_s, session_seq)
         buy_entry_open := false
         buy_won_this_entry := false
         buy_lost_this_entry := false
     if signal_buy and sell_entry_open
-        if sell_won_this_entry or sell_lost_this_entry
-            sell_results := add_result(sell_results, sell_won_this_entry, maxSignalsToTrack)
-            record_module(mod_results, strat_id(sell_entry_strategy), false, sell_won_this_entry, maxSignalsToTrack)
+        if sell_won_this_entry
+            array.push(sell_win_s, session_seq)
+            record_module(mod_results, strat_id(sell_entry_strategy), false, true, maxSignalsToTrack)
+        else if sell_lost_this_entry
+            array.push(sell_loss_s, session_seq)
+            record_module(mod_results, strat_id(sell_entry_strategy), false, false, maxSignalsToTrack)
+        else
+            array.push(sell_unr_s, session_seq)
         sell_entry_open := false
         sell_won_this_entry := false
         sell_lost_this_entry := false
 
     // Open the new entry — stamp it with the module the router picked this
-    // bar, and count it toward the dashboard's total-fired context stat
-    // (counted here, at open, regardless of how it eventually resolves).
+    // bar. (Nothing is counted at open now; a trade enters a W/L/U bucket
+    // only when it closes — see the close blocks above.)
     if signal_buy
         buy_entry_open := true
         buy_won_this_entry := false
         buy_lost_this_entry := false
         buy_entry_strategy := active_strategy
-        array.push(buy_fire_sessions, session_seq)
     if signal_sell
         sell_entry_open := true
         sell_won_this_entry := false
         sell_lost_this_entry := false
         sell_entry_strategy := active_strategy
-        array.push(sell_fire_sessions, session_seq)
 
 //======================================================================
 // UPDATE SIGNAL P&L TRACKING (INDEPENDENT SYSTEM)
@@ -1709,7 +1743,9 @@ if signal_sell
 // on THIS bar is picked up immediately rather than lagging a bar behind.
 int   verdict_wins  = last_signal_type == "BUY" ? totalWins_buy : totalWins_sell
 int   verdict_total = last_signal_type == "BUY" ? totalTrades_buy : totalTrades_sell
-int   verdict_fired = last_signal_type == "BUY" ? buy_signals_fired : sell_signals_fired
+// fired = W + L + U for that direction, same window as verdict_total — so
+// trade_verdict's resolution_rate = total / fired is a clean [0,1] ratio.
+int   verdict_fired = last_signal_type == "BUY" ? buy_w + buy_l + buy_u : sell_w + sell_l + sell_u
 [verdict_text, verdict_color] = trade_verdict(verdict_wins, verdict_total, verdict_fired, pnlTarget)
 
 //======================================================================
@@ -2066,19 +2102,15 @@ if showDash and barstate.islast
         table.merge_cells(d, 0, row, 1, row)
         row += 1
 
-        // BUY Win Rate — % is wins/(wins+losses) among RESOLVED entries only
-        // (totalTrades_buy). buy_signals_fired is the separate count of every
-        // BUY signal fired, resolved or not, in the last FIRED_LOOKBACK_SESSIONS
-        // trading sessions, shown for context.
-        string buy_count_text = totalTrades_buy >= maxSignalsToTrack ?
-                                 str.tostring(totalWins_buy) + "/" + str.tostring(totalTrades_buy) + " (max)" :
-                                 str.tostring(totalWins_buy) + "/" + str.tostring(totalTrades_buy)
+        // BUY Win Rate — W / L / U over the trailing WINRATE_LOOKBACK_SESSIONS
+        // trading sessions (all three bucketed at trade CLOSE). % = W/(W+L);
+        // ↺ is same-day reversals that never hit +/-pnlTarget. fired (what the
+        // Trade Signal verdict reads) = W + L + U.
+        string buy_rate_display = (totalTrades_buy > 0 ? str.tostring(success_rate_buy, "#.#") + "%" : "—") +
+             "  ·  " + str.tostring(buy_w) + "W " + str.tostring(buy_l) + "L " + str.tostring(buy_u) + "↺"
 
-        string buy_rate_display = (totalTrades_buy > 0 ?
-                                  str.tostring(success_rate_buy, "#.#") + "% [" + buy_count_text + "]" :
-                                  "— [0/0]") + " (" + str.tostring(buy_signals_fired) + " fired)"
-
-        color buy_rate_color = success_rate_buy >= 60 ? color.lime :
+        color buy_rate_color = totalTrades_buy == 0 ? color.new(color.gray, 40) :
+                               success_rate_buy >= 60 ? color.lime :
                                success_rate_buy >= 50 ? color.yellow : color.red
 
         table.cell(d, 0, row, "BUY Win Rate",
@@ -2090,20 +2122,14 @@ if showDash and barstate.islast
              text_size = size.small)
         row += 1
 
-        // SELL Win Rate — % is wins/(wins+losses) among RESOLVED entries only
-        // (totalTrades_sell). sell_signals_fired is the separate count of every
-        // SELL signal fired, resolved or not, in the last FIRED_LOOKBACK_SESSIONS
-        // trading sessions, shown for context.
-        string sell_count_text = totalTrades_sell >= maxSignalsToTrack ?
-                                 str.tostring(totalWins_sell) + "/" + str.tostring(totalTrades_sell) + " (max)" :
-                                 str.tostring(totalWins_sell) + "/" + str.tostring(totalTrades_sell)
+        // SELL Win Rate — W / L / U over the trailing WINRATE_LOOKBACK_SESSIONS
+        // trading sessions, same construction as the BUY row above.
+        string sell_rate_display = (totalTrades_sell > 0 ? str.tostring(success_rate_sell, "#.#") + "%" : "—") +
+             "  ·  " + str.tostring(sell_w) + "W " + str.tostring(sell_l) + "L " + str.tostring(sell_u) + "↺"
 
-        string sell_rate_display = (totalTrades_sell > 0 ?
-                                   str.tostring(success_rate_sell, "#.#") + "% [" + sell_count_text + "]" :
-                                   "— [0/0]") + " (" + str.tostring(sell_signals_fired) + " fired)"
-
-        color sell_rate_color = success_rate_sell >= 60 ? color.lime :
-                                 success_rate_sell >= 50 ? color.yellow : color.red
+        color sell_rate_color = totalTrades_sell == 0 ? color.new(color.gray, 40) :
+                               success_rate_sell >= 60 ? color.lime :
+                               success_rate_sell >= 50 ? color.yellow : color.red
 
         table.cell(d, 0, row, "SELL Win Rate",
              text_color = color.white,
