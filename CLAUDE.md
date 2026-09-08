@@ -82,7 +82,8 @@ Sequential sections — order matters in Pine Script:
    - **Trend Pullback** (`tp_*`) — the live module: anchor + 5-component
      confluence + quality filter. `sigTime` pinned to `"Score"` (fires off
      `is_bull`/`is_bear` + `entry_is_fresh` + `barstate.isconfirmed`). ANDs in
-     `in_session` and `anchor_ready`. `tp_quality = final_score`.
+     `in_session` and `anchor_ready`. `tp_quality = final_score`. The `"Trend"`
+     mode branch is retained but unreachable.
    - **ORB** (`orb_*`) — inert.
    - **Router** — `active_strategy`/`strat_long`/`strat_short`/`strat_quality`,
      last-write-wins Trend Pullback → ORB; always resolves to Trend Pullback.
@@ -120,7 +121,8 @@ Sequential sections — order matters in Pine Script:
 
 ## Scoring Components
 
-All 5 sum to `raw_score`, capped at 100. Component maxes total 105 pre-cap.
+All 5 sum to `raw_score`, capped at 100. Component maxes total 105 pre-cap and
+are assembled differently per profile — check all five when changing weights.
 
 | # | Component | Max | Varies by profile? |
 |---|-----------|-----|-------------------|
@@ -135,21 +137,27 @@ All 5 sum to `raw_score`, capped at 100. Component maxes total 105 pre-cap.
   (30%) = close beyond ema50 only; Zero = counter-trend. Direction is the
   selected anchor (`is_bull`/`is_bear`) — it's a directional confluence term.
   Always scores against `ema20`, never `emaSlow`.
-- **C2 — VWAP Value:** tiers by distance from VWAP on the correct side —
-  BOUNCE/REJECTION (full), HEALTHY (72%), EXTENDED (40%), REVERSION RISK (0),
-  GRACE ZONE (20%, wrong side, bear tolerance is half the bull's), WRONG SIDE (0).
+- **C2 — VWAP Value:** by distance from VWAP, correct side — BOUNCE/REJECTION
+  (full, within `0.33 × vwap_h_limit`), HEALTHY (72%, within `vwap_h_limit`),
+  EXTENDED (40%, within `vwap_e_limit`), REVERSION RISK (0, beyond
+  `vwap_e_limit`). Slightly wrong side = GRACE ZONE (20%): bull within
+  `0.2 × vwap_h_limit`, bear within `0.1 ×` (intentionally stricter — short-side
+  entries near VWAP carry more reversion risk); further wrong = WRONG SIDE (0).
   For a volume-less cash index `vwap` is the proxy's VWAP rescaled to index units,
   or a session TWAP if no proxy resolves. Volume-less non-index (forex) → `na`,
   C2 scores 0.
 - **C3 — Volume Intensity:** 25/20/15/10/5/0 at RVOL ≥2.5/2.0/1.5/1.2/1.0/below.
   RVOL from `vol_eff` (proxy or chart volume); `1.0` fallback (fixed 5 pts) with
   no working proxy.
-- **C4 — ADX Strength:** nested tiers scaling with profile `adx_min`; rising
-  (2-bar) qualifies each tier. 15 down to 0.
-- **C5 — Momentum Confluence (max 20):** 5A RSI (12) regime-aware, bear side
-  mirrors bull about 50; 5B Squeeze Release (8) — release + RVOL >1.5 → 8, release
-  alone → 3. MACD sub-component removed (near-duplicate of C1); its points went to
-  RSI (7→12) and Squeeze (5→8).
+- **C4 — ADX Strength:** nested tiers vs profile `adx_min`, rising (2-bar)
+  qualifies: 15 at `≥1.6×` rising / 12 not rising; 12 at `[1.3×, 1.6×)` rising /
+  9 not; 9 at `[1.0×, 1.3×)` (no rising check); 6/3/0 at `≥0.8×` / `≥0.6×` / below.
+- **C5 — Momentum Confluence (max 20):** 5A RSI (12) regime-aware — bull: RSI >60
+  rising (12) / 45–60 (8) / stalling >60 not rising (3) / else 0; bear mirrors
+  about 50: RSI <40 not rising (12) / 40–55 (8) / stalling <40 rising (3) / else 0.
+  5B Squeeze Release (8) — release + RVOL >1.5 → 8, release alone → 3. MACD
+  sub-component removed (near-duplicate of C1); its points went to RSI (7→12) and
+  Squeeze (5→8).
 
 **Setup quality rating** (on `final_score`, `threshold = min_score_auto`,
 45–55 by profile):
@@ -380,6 +388,17 @@ keyed by the module that **opened** the entry (U not tracked per-module).
 — Pine arrays can't nest), still FIFO-capped by signal count, **not**
 session-windowed — reconcile if a second module goes live. Dashboard rows gated on
 `multi_module = orbEnabled` (false), so suppressed; slot 0 still accumulates.
+
+**Time-of-Day Relative Volume:** `rel_vol` (C3, Gate 4, C5B) with `rvolMode`
+pinned to `"Time-of-Day"` compares the current bar's volume to the average of the
+*same bar-slot* (bars since session open) across the prior `rvolLookbackDays`
+(10) completed sessions — removing the U-shaped intraday bias a trailing SMA has
+(overstates near the open, understates at lunch). History in `array<TodSession>`
+(UDT-wrapped `array<float>` — arrays can't nest). Session boundaries reuse
+`is_new_session`. Falls back to `ta.sma(volume, 20)` when a slot has fewer than 3
+historical sessions (or if Rolling 20-bar were selected). Dashboard Volume row
+shows `TOD` / `20-bar` / `20-bar*` (in-flight TOD→fallback), `proxy·`-prefixed
+when the series is a proxy's. Feeds off `vol_eff`.
 
 **Index Data Proxy:** a cash index (SPX, IXIC/NDX, S&P/TSX, ...) usually reports
 `volume` as `na`/0, which guts C2 (VWAP → 0), C3 (RVOL pinned to 1.0), C5B, and
