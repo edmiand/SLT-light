@@ -1426,6 +1426,7 @@ trade_verdict(int wins, int total, int fired, float target) =>
     color  vcolor  = color.gray
     if total < VERDICT_MIN_SAMPLE
         verdict := "WAIT (" + str.tostring(total) + "/" + str.tostring(VERDICT_MIN_SAMPLE) + ")"
+        vcolor  := color.orange
     else
         float resolution_rate = fired > 0 ? total / fired : 0.0
         if resolution_rate < VERDICT_MIN_RESOLUTION
