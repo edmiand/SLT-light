@@ -127,6 +127,17 @@ extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
      tooltip = "Adds the per-component point breakdown plus the Volatility, ATR Fuel, Bars From Flip and " +
                "Gate Details rows. The BUY/SELL win-rate + Trade Signal rows show regardless of this setting.")
 
+grp_proxy = "🧩 Index Data Proxy"
+proxyOverride = input.string("Auto", "Volume / VWAP Proxy", group = grp_proxy,
+     tooltip = "Cash indices (SPX, NASDAQ Composite, S&P/TSX, ...) usually report no volume, which " +
+               "silently disables the VWAP and Volume scoring components. When the chart symbol is a " +
+               "volume-less index, this borrows VWAP + relative-volume from a liquid ETF that tracks it " +
+               "nearly tick-for-tick during regular hours.\n\n" +
+               "Auto: QQQ for Nasdaq symbols, XIC for S&P/TSX symbols, SPY for everything else.\n" +
+               "Override: type an exchange-qualified ticker (e.g. AMEX:SPY, NASDAQ:QQQ, TSX:XIC).\n\n" +
+               "Has no effect on any symbol that already carries its own volume (stocks, ETFs, futures) " +
+               "or on non-index symbols such as forex.")
+
 //======================================================================
 // FIXED BEHAVIOUR
 // User-configurable in the parent script; pinned here to the tuned
@@ -319,6 +330,56 @@ int   minScoreSell     = min_score_auto
 int   maxBarsFromFlip  = anchorMode == "SMA" ? 0 : len10
 
 //======================================================================
+// INDEX DATA PROXY  (cash indices carry no volume — borrow from an ETF)
+//======================================================================
+// A cash-index feed (SPX, IXIC, TSX, NDQ, ...) usually reports volume as
+// na/0. That silently guts the scoring engine: Component 2 (VWAP Value)
+// needs volume for ta.vwap and collapses to 0, Component 3 (Volume
+// Intensity) pins to its 5-pt floor, Component 5B caps at 3, and Gate 4
+// can't evaluate. When the chart symbol is an index with no usable volume,
+// pull VWAP + relative-volume inputs from a liquid tradable proxy
+// (SPY / QQQ / XIC) that tracks it nearly tick-for-tick in RTH, so the full
+// engine stays alive. Every other symbol (stocks / ETFs / futures / forex)
+// is untouched — proxy usage is gated on `syminfo.type == "index"` AND the
+// chart never having shown positive volume.
+//
+// `chart_has_volume` latches true the first time real volume is seen (an
+// index feed never does; a real symbol does on bar 0-1). Kept as a var
+// latch rather than `ta.sma(volume,20) > 0` so it can't flip mid-history.
+var bool chart_has_volume = false
+if not na(volume) and volume > 0
+    chart_has_volume := true
+
+// Auto proxy by index family; a non-"Auto" override string wins outright.
+string sym_up     = str.upper(syminfo.ticker)
+bool   sym_is_ndx = str.contains(sym_up, "NDX") or str.contains(sym_up, "IXIC") or str.contains(sym_up, "NDQ") or str.contains(sym_up, "NAS100") or str.contains(sym_up, "US100") or str.contains(sym_up, "USTEC")
+bool   sym_is_tsx = str.contains(sym_up, "TSX") or str.contains(sym_up, "TX60") or str.contains(sym_up, "SPTSX")
+string proxy_ticker = proxyOverride != "Auto" and str.length(proxyOverride) > 0 ? proxyOverride :
+     (sym_is_ndx ? "NASDAQ:QQQ" : (sym_is_tsx ? "TSX:XIC" : "AMEX:SPY"))
+
+// One security call: proxy session VWAP, proxy close (to rescale VWAP into
+// index price units), proxy bar volume, proxy 20-bar volume SMA. lookahead
+// off — same non-repaint contract as the daily ATR request below.
+[proxy_vwap_raw, proxy_close_raw, proxy_vol_raw, proxy_vol_ma_raw] = request.security(
+     proxy_ticker, timeframe.period,
+     [ta.vwap(close), close, volume, ta.sma(volume, len20)],
+     lookahead = barmerge.lookahead_off)
+
+bool proxy_eligible = syminfo.type == "index" and not chart_has_volume
+bool proxy_ok       = not na(proxy_vol_ma_raw) and proxy_vol_ma_raw > 0 and
+     not na(proxy_vwap_raw) and not na(proxy_close_raw) and proxy_close_raw > 0
+bool use_proxy      = proxy_eligible and proxy_ok
+
+// Proxy VWAP rescaled to the index's own price units: same fractional
+// deviation from VWAP the proxy shows, expressed at index scale, so
+// Component 2's `(close - vwap) / vwap` math is unchanged.
+float proxy_vwap_scaled = use_proxy ? close * (proxy_vwap_raw / proxy_close_raw) : na
+
+// Effective volume series for every RVOL consumer (Component 3, Gate 4,
+// Component 5B, the Time-of-Day history).
+float vol_eff = use_proxy ? proxy_vol_raw : volume
+
+//======================================================================
 // CORE INDICATOR CALCULATIONS
 //======================================================================
 
@@ -456,7 +517,7 @@ if is_new_session
     tod_current_session := TodSession.new(array.new<float>())
     tod_slot_idx := 0
 
-array.push(tod_current_session.vols, volume)
+array.push(tod_current_session.vols, vol_eff)  // proxy volume when use_proxy, else chart volume
 
 // Average volume at this same bar-slot across prior sessions
 float tod_vol_sum = 0.0
@@ -478,22 +539,26 @@ tod_slot_idx += 1
 // Relative Volume: Rolling 20-bar (always computed, used as fallback) +
 // Time-of-Day (used when selected and sufficient history exists)
 vol_ma20 = ta.sma(volume, len20)
-// The `: 1.0` fallback is what makes volume-less feeds (index symbols such as
-// TVC:NDQ or TSX:TSX, where volume is na/0) behave sanely: rel_vol becomes a
-// neutral 1.0 instead of na. Two consequences depend on that exact value —
+// vol_ma_eff / vol_eff are the proxy series when use_proxy (a volume-less
+// index borrowing an ETF's tape), otherwise the chart's own volume.
+float vol_ma_eff = use_proxy ? proxy_vol_ma_raw : vol_ma20
+// The `: 1.0` fallback still catches the residual volume-less case — a
+// non-index volume-less feed, or an index whose proxy failed to resolve
+// (proxy_ok false). rel_vol becomes a neutral 1.0 instead of na. Two
+// consequences depend on that exact value —
 //   1. Component 3 awards its `>= 1.0` tier (5 pts) rather than 0.
 //   2. Gate 4 stays quiet, because `volume_is_dead` tests `rel_vol < rvol_gate`
 //      and MARKET's rvol_gate is also exactly 1.0.
 // That second one is a knife-edge tie, not a design: raising MARKET's rvol_gate
 // above 1.0 would silently pin a permanent -25 liquidity penalty on every
-// volume-less index. If you tune that value, add an explicit volume-availability
-// check here instead of relying on this fallback.
-float rel_vol_rolling = vol_ma20 > 0 ? volume / vol_ma20 : 1.0
-float rel_vol_tod = tod_data_sufficient and not na(tod_vol_avg) and tod_vol_avg > 0 ? volume / tod_vol_avg : na
+// volume-less index that also has no working proxy. If you tune that value, add
+// an explicit volume-availability check here instead of relying on this fallback.
+float rel_vol_rolling = vol_ma_eff > 0 ? vol_eff / vol_ma_eff : 1.0
+float rel_vol_tod = tod_data_sufficient and not na(tod_vol_avg) and tod_vol_avg > 0 ? vol_eff / tod_vol_avg : na
 
 bool tod_rvol_active = rvolMode == "Time-of-Day" and not na(rel_vol_tod)
 rel_vol = tod_rvol_active ? rel_vol_tod : rel_vol_rolling
-string rvol_mode_label = tod_rvol_active ? "TOD" : (rvolMode == "Time-of-Day" ? "20-bar*" : "20-bar")
+string rvol_mode_label = (use_proxy ? "proxy·" : "") + (tod_rvol_active ? "TOD" : (rvolMode == "Time-of-Day" ? "20-bar*" : "20-bar"))
 
 
 //======================================================================
@@ -637,6 +702,30 @@ else if is_bear
     else
         t_pts := 0
         t_status := "🔴 COUNTER-TREND"
+
+// --- Value reference for Component 2 -------------------------------------
+// Component 2 scores "how far is price from a fair-value line". That line is:
+//   chart has volume            -> the real session VWAP (unchanged)
+//   volume-less index + proxy    -> the proxy's VWAP, rescaled to index units
+//   neither (no proxy)           -> a session TWAP: running mean of hlc3 since
+//                                   the session open, a volume-free stand-in.
+// `vwap` is reassigned once, here, so the ~12 downstream references in
+// Component 2 (and the inert ORB block) need no change.
+var float twap_cum = na
+var float twap_n   = na
+if is_new_session
+    twap_cum := 0.0
+    twap_n   := 0.0
+twap_cum := nz(twap_cum) + hlc3
+twap_n   := nz(twap_n) + 1
+float session_twap = twap_n > 0 ? twap_cum / twap_n : close
+
+// Non-index volume-less feeds (e.g. forex) are deliberately left as-is
+// (`vwap` stays the na ta.vwap -> Component 2 inactive, unchanged behaviour);
+// only the index case gets the proxy / TWAP substitute.
+vwap := chart_has_volume ? vwap :
+     use_proxy and not na(proxy_vwap_scaled) ? proxy_vwap_scaled :
+     proxy_eligible ? session_twap : vwap
 
 // COMPONENT 2: VWAP VALUE ANCHOR (profile-adaptive: 20-25 points)
 int v_pts = 0
@@ -1874,9 +1963,14 @@ if showDash and barstate.islast
     table.cell(d, 1, row, trend_cell, text_color = trend_color, text_size = size.small)
     row += 1
     
-    // Profile Name
+    // Profile Name (+ index-proxy status when a volume-less index is
+    // borrowing an ETF's VWAP/volume, or a warning when it can't).
+    string profile_cell = profile_name +
+         (use_proxy ? "  ·  " + proxy_ticker + " data" :
+          proxy_eligible ? "  ·  ⚠️ no volume / no proxy" : "")
+    color profile_color = proxy_eligible and not use_proxy ? color.orange : color.white
     table.cell(d, 0, row, "Profile", text_color = color.white, text_halign = text.align_left, text_size = size.small)
-    table.cell(d, 1, row, profile_name, text_color = color.white, text_size = size.small)
+    table.cell(d, 1, row, profile_cell, text_color = profile_color, text_size = size.small)
     row += 1
     
     // Signal Anchor Display with dynamic EMA period
