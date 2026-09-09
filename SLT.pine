@@ -1213,32 +1213,55 @@ bool normal_stop_reached   = not pnl_exit_fired and barstate.isconfirmed and in_
 // resolved normally this same bar (target_hit/stop_hit), so the two paths
 // can never both claim the same exit.
 bool day_end_fallback = is_new_session and in_session and prev_in_session and not target_hit and not stop_hit
-bool day_end_trigger  = session_just_closed or day_end_fallback
 
-// Evaluated on day_end_trigger (the first OFF-hours bar, or the calendar-
-// rollover fallback bar), using close[1] (the actual last bar of the period
-// that just ended) rather than the current bar's close, which may already
-// have drifted further. The label/alert gets anchored back to
-// bar_index[1]/close[1] at the draw site so it appears at the correct spot
-// on the chart even though the code runs one bar late. Gated on
-// day_end_trigger since it's otherwise read only on that one bar per day —
-// no need to pay the division on every other confirmed bar.
+// Third path — fire the resolution ON the last in-session bar itself, at the
+// LIVE EDGE only (barstate.islast). session_just_closed and day_end_fallback
+// both need a bar AFTER the close to fire on; on an RTH-only feed viewed live
+// right at the close there isn't one until the next session opens, so the
+// day-end bubble would not appear for hours. This instead detects "the current
+// (final) bar's wall-clock close has reached the tradingHours end time".
+// NOTE: this is NOT the time_close(timeframe, session) attempt that failed
+// before (see RTH SESSION WINDOW) — it reads the plain time_close bar-close
+// timestamp and compares it to the session-end minute parsed out of
+// tradingHours ("HHMM-HHMM:DDDDD", last range if comma-separated). Historical
+// days are untouched: barstate.islast is only ever the dataset's last bar, so
+// every earlier day still resolves via session_just_closed, and on reload this
+// same bar re-resolves via that path at the identical bar/price/%.
+var array<string> _th_dash_parts = str.split(tradingHours, "-")
+var string        _th_last_range = array.get(_th_dash_parts, array.size(_th_dash_parts) - 1)
+var string        _th_end_str    = array.get(str.split(_th_last_range, ":"), 0)
+var float         _th_end_hhmm   = str.tonumber(_th_end_str)
+var int session_end_mins = not na(_th_end_hhmm) ? int(_th_end_hhmm / 100) * 60 + int(_th_end_hhmm) % 100 : na
+int  bar_close_mins      = hour(time_close, syminfo.timezone) * 60 + minute(time_close, syminfo.timezone)
+bool reached_session_end = not na(session_end_mins) and bar_close_mins >= session_end_mins
+bool day_end_onbar   = barstate.islast and barstate.isconfirmed and in_session and reached_session_end
+
+bool day_end_trigger  = session_just_closed or day_end_fallback or day_end_onbar
+
+// Evaluated on day_end_trigger. The two one-bar-late paths (first OFF-hours
+// bar, or the calendar-rollover fallback bar) read close[1] — the actual last
+// bar of the period that just ended — and the draw site anchors the label back
+// to bar_index[1]/close[1]. The onbar path already runs on that final bar, so
+// it reads close and anchors there. Gated on day_end_trigger since it's
+// otherwise read only on that one bar per day.
 float day_end_pnl = 0.0
 if day_end_trigger
+    float de_px = day_end_onbar ? close : close[1]
     if pnl_direction == "BUY" and not na(pnl_entry_price)
-        day_end_pnl := ((close[1] - pnl_entry_price) / pnl_entry_price) * 100
+        day_end_pnl := ((de_px - pnl_entry_price) / pnl_entry_price) * 100
     else if pnl_direction == "SELL" and not na(pnl_entry_price)
-        day_end_pnl := ((pnl_entry_price - close[1]) / pnl_entry_price) * 100
+        day_end_pnl := ((pnl_entry_price - de_px) / pnl_entry_price) * 100
 
-// Requires the entry to have opened at least one bar before the trigger bar
-// (pnl_entry_bar < bar_index - 1) — otherwise the entry opened on the very
-// last bar the trigger is resolving, so close[1] IS the entry price and
-// day_end_pnl is a trivial, meaningless exact-zero. Such an entry never had
-// any real market exposure, so it's left unresolved (excluded from win/loss,
-// same as any other same-day reversal that never hit target or stop) instead
-// of being force-scored as a zero-P&L win.
+// Requires the entry to have opened before the bar the trigger is resolving —
+// otherwise close/close[1] IS the entry price and day_end_pnl is a trivial,
+// meaningless exact-zero. Such an entry never had real market exposure, so it's
+// left unresolved (excluded from win/loss, same as any other same-day reversal
+// that never hit target or stop) rather than force-scored as a zero-P&L win.
+// The onbar path resolves on bar_index, so its cutoff is one bar tighter than
+// the one-bar-late paths' bar_index - 1.
+bool day_end_entry_ok = day_end_onbar ? (pnl_entry_bar < bar_index) : (pnl_entry_bar < bar_index - 1)
 bool day_end_close    = day_end_trigger and pnl_direction != "NONE" and not pnl_exit_fired and
-     barstate.isconfirmed and not na(pnl_entry_bar) and pnl_entry_bar < bar_index - 1
+     barstate.isconfirmed and not na(pnl_entry_bar) and day_end_entry_ok
 bool day_end_win_hit  = day_end_close and day_end_pnl >= 0
 bool day_end_loss_hit = day_end_close and day_end_pnl < 0
 
@@ -1918,8 +1941,11 @@ if signal_sell and showLabels
 // (bar_index - 1 / close[1]), since the code itself runs one bar late.
 // Normal: anchored to this bar as usual.
 day_end_label_anchor(bool is_day_end) =>
-    int   lb = is_day_end ? bar_index - 1 : bar_index
-    float lp = is_day_end ? close[1] : anchor_line_price
+    // The one-bar-late day-end paths anchor back to bar_index-1/close[1]; the
+    // onbar path already IS the final bar, so it anchors here at close.
+    bool late = is_day_end and not day_end_onbar
+    int   lb = late ? bar_index - 1 : bar_index
+    float lp = late ? close[1] : (is_day_end ? close : anchor_line_price)
     [lb, lp]
 
 // A live signal_buy/signal_sell reversing the position takes precedence

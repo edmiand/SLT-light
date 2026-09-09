@@ -335,15 +335,24 @@ that opened the position). *Signal P&L History* on labels, `%` from
 `±pnlTarget`, once per entry, `in_session`-gated. `target_reached =
 normal_target_reached or day_end_win_hit` (mirror for stop), so all downstream
 consumers are covered by two booleans. `day_end_trigger = session_just_closed or
-day_end_fallback`: `session_just_closed = not in_session and prev_in_session`
-(first off-hours bar, one bar late) is the normal path; `day_end_fallback` keys
-off the calendar-day rollover (`is_new_session`) for a 24h-widened `tradingHours`
-where `in_session` never goes false. At the trigger, if still unresolved
-(`pnl_direction != "NONE"`, `not pnl_exit_fired`, `pnl_entry_bar < bar_index - 1`
-— excludes an entry opened on the very bar being resolved, which would
-force-score a meaningless 0% win), it resolves by the sign of `day_end_pnl`
-(from `close[1]` — the real last-bar price). Label/alert anchored back to
-`bar_index - 1` / `close[1]`; dashboard live P&L freezes at `day_end_frozen_pnl`.
+day_end_fallback or day_end_onbar`, three paths: `session_just_closed = not
+in_session and prev_in_session` (first off-hours bar, one bar late) is the normal
+path; `day_end_fallback` keys off the calendar-day rollover (`is_new_session`)
+for a 24h-widened `tradingHours` where `in_session` never goes false;
+`day_end_onbar` fires **on the final in-session bar itself, at the live edge
+only** (`barstate.islast and barstate.isconfirmed and in_session and
+bar_close_mins >= session_end_mins`, where `session_end_mins` is parsed once from
+`tradingHours`) — without it, an RTH-only feed viewed live at the close has no
+later bar and the bubble waits hours for the next session. Historical days are
+untouched (`barstate.islast` is only the dataset's last bar); on reload the same
+bar re-resolves via `session_just_closed` at the identical bar/price. At the
+trigger, if still unresolved (`pnl_direction != "NONE"`, `not pnl_exit_fired`,
+and the entry opened before the resolving bar — `< bar_index` for `day_end_onbar`,
+`< bar_index - 1` for the two late paths — else a meaningless 0% win), it
+resolves by the sign of `day_end_pnl` (`day_end_onbar` reads `close`, the late
+paths `close[1]`). Label/alert anchored to that same bar (`bar_index`/`close`
+onbar, `bar_index - 1`/`close[1]` late); dashboard live P&L freezes at
+`day_end_frozen_pnl`.
 `enablePnL` gates only `signal_profit`/`signal_loss` (labels + alerts), never
 resolution or win-rate scoring — keep any future stats logic on
 `target_reached`/`stop_reached`.
@@ -503,7 +512,10 @@ No test runner. After any edit, verify in the Pine Editor:
 18. **Day-end resolution:** a position short of `±pnlTarget` at the close →
     `PROFIT/LOSS +<actual%>` anchored at the actual last in-session bar, counted
     into the win rate, no further label on later off-hours bars; live P&L freezes
-    at the day-end value.
+    at the day-end value. On an RTH-only feed watched live at the close the
+    bubble appears **on that last bar** the moment it confirms (`day_end_onbar`),
+    not only once a later bar prints; scroll back / reload → the label stays on
+    the same bar (now via `session_just_closed`).
 19. **Day-end fallback:** with `tradingHours` widened to 24h, a position that
     never hits target still force-resolves at the calendar-day rollover; a signal
     opening on that exact bar shows `U`, not a false `W`.
