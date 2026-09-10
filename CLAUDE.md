@@ -104,7 +104,7 @@ Sequential sections — order matters in Pine Script:
 11. **Success rate tracking** — every closed BUY/SELL trade lands in one of three
     per-direction `var array<int>` (W = `target_reached`, L = `stop_reached`,
     U = same-day reversal with neither). Front-trimmed every bar to the trailing
-    `WINRATE_LOOKBACK_SESSIONS` (15) trading sessions. The numbers compose:
+    `WINRATE_LOOKBACK_SESSIONS` (20) trading sessions. The numbers compose:
     win rate = `W/(W+L)`, resolved = `W+L`, fired = `W+L+U`. The **Trade Signal**
     verdict row turns the last-fired direction's stats into TRADE/CAUTION/SKIP/
     WAIT. Per-module store (`mod_results`) still runs but its rows are suppressed
@@ -371,7 +371,7 @@ the only way to stay unresolved since day-end forced resolution).
 `buy_won_this_entry`/`buy_lost_this_entry` accumulate during the open trade;
 `buy_entry_open` guards against scoring before a trade opens; all flags cleared
 at both close paths. **Every bar** the six arrays are front-trimmed (no scan —
-`session_seq` is non-decreasing) to the trailing `WINRATE_LOOKBACK_SESSIONS` (15)
+`session_seq` is non-decreasing) to the trailing `WINRATE_LOOKBACK_SESSIONS` (20)
 trading sessions via `trim_window()`. `buy_w`/`buy_l`/`buy_u` = trimmed
 `array.size(...)`, recomputed every bar. `session_seq` counts **trading
 sessions** (`is_new_session`), so weekends don't shrink the window. The numbers
@@ -496,9 +496,9 @@ No test runner. After any edit, verify in the Pine Editor:
     outside `tradingHours`.
 12. **Entry freshness:** EMA Cross → no signal >10 bars after a flip; SMA →
     "Bars From Flip" reads `(unlimited)`.
-13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺` over the trailing 15
+13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺` over the trailing 20
     sessions; the three compose (rate `= W/(W+L)`, `W+L+U` = all closed trades);
-    counts fall off as close bars age past 15 sessions; window survives a
+    counts fall off as close bars age past 20 sessions; window survives a
     weekend gap unshrunk; grey when `W+L = 0`. No per-module rows.
 14. **`enablePnL` independence:** turning P&L Exit OFF stops PROFIT/LOSS
     labels + alerts but win rates keep resolving (must NOT collapse to 0%).

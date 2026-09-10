@@ -33,7 +33,7 @@ const int DASHBOARD_MAX_ROWS = 36
 // shrink it — mirrors the rvolLookbackDays convention). Both the win-rate %
 // and the "fired" total the Trade Signal verdict reads come from this one
 // window, so they compose: fired = W + L + U, rate = W / (W + L).
-const int WINRATE_LOOKBACK_SESSIONS = 15
+const int WINRATE_LOOKBACK_SESSIONS = 20
 
 // Trade-verdict row ("Trade Signal" on the dashboard) — turns the resolved
 // win rate for whichever direction fired last into a TRADE / CAUTION / SKIP
