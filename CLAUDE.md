@@ -32,7 +32,8 @@ Everything else is **auto-tuned** from the asset profile + anchor (see
 top of the file: `showLabels=true`, `sigTime="Score"`, `gateOn=true`,
 `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, `enableSuccessRate=true`,
 `maxSignalsToTrack=50`, `showSignalPnL=true`, `showCircles=true`,
-`oversizedBarATR=2.2`. There is no `showBg` (no `bgcolor()` in this build).
+`oversizedBarATR=2.2`, `oversizedBarWindowBars=15`. There is no `showBg` (no
+`bgcolor()` in this build).
 
 **Retired modules:** VWAP Fade is deleted entirely. ORB is inert
 (`orbEnabled=false` constant + 7 tuning constants) — its module/router/dashboard/
@@ -326,16 +327,24 @@ force-scoring positions at e.g. a lunch break. Not auto-corrected — keep
 (SMA latches on the flip bar; EMA crosses lag). Constrains Score-mode entries via
 `entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip`.
 
-**Oversized-bar filter:** `bar_not_oversized = na(atr) or atr <= 0 or (high -
-low) <= oversizedBarATR × atr` (`oversizedBarATR` pinned `2.2`; `atr` is the
-intraday tf-scaled `ta.atr(len14)`, **not** the daily `atr_14`). AND'd into both
-`tp_long`/`tp_short` branches so a signal fired on a climax/expansion bar is
-suppressed no matter how high its score — an opening-spike bar maxes the
-momentum/volume/ADX components while it prints, so the star filter can't catch
-it. Condition-based, not a cooldown: the next clean bar fires normally once
-ranges normalize. Non-repainting — `high`/`low` are final on the
-`barstate.isconfirmed` bar the Score branch already requires. To retune, edit the
-constant in `FIXED BEHAVIOUR`; there is no panel input.
+**Oversized-bar filter:** `bar_not_oversized = not in_oversized_window or
+na(atr) or atr <= 0 or (high - low) <= oversizedBarATR × atr` (`oversizedBarATR`
+pinned `2.2`; `atr` is the intraday tf-scaled `ta.atr(len14)`, **not** the daily
+`atr_14`). AND'd into both `tp_long`/`tp_short` branches so a signal fired on a
+climax/expansion bar is suppressed no matter how high its score — an
+opening-spike bar maxes the momentum/volume/ADX components while it prints, so
+the star filter can't catch it. **Scoped to the opening window only:**
+`in_oversized_window = bars_since_open <= oversized_window` where
+`bars_since_open` resets on `session_just_opened` and `oversized_window =
+round(oversizedBarWindowBars × tf_scale)` (`oversizedBarWindowBars` pinned `15`,
+i.e. ~30 min on a 2-min chart). All-day application *degraded* win rate — a
+blocked signal is also a blocked reversal, so a losing position rode through the
+big bar to a worse exit, and legit momentum-continuation entries got cut.
+Condition-based, not a cooldown: inside the window the next clean bar fires
+normally once ranges normalize; outside it the existing gates handle big bars.
+Non-repainting — `high`/`low` are final on the `barstate.isconfirmed` bar the
+Score branch already requires. To retune, edit the two constants in `FIXED
+BEHAVIOUR`; there is no panel input.
 
 **Two P&L systems (independent):** *Live dashboard P&L* from `pnl_entry_price`,
 reset on every new signal (strict alternation means entry always = the signal
@@ -508,10 +517,12 @@ No test runner. After any edit, verify in the Pine Editor:
     outside `tradingHours`.
 12. **Entry freshness:** EMA Cross → no signal >10 bars after a flip; SMA →
     "Bars From Flip" reads `(unlimited)`.
-12b. **Oversized-bar filter:** no BUY/SELL label prints on a bar whose
+12b. **Oversized-bar filter:** within the first `oversizedBarWindowBars` (15,
+    tf-scaled) bars after the open, no BUY/SELL label prints on a bar whose
     `high - low` exceeds `oversizedBarATR × ta.atr(len14)` (2.2×); the opening
-    2-min whipsaw cluster on a volatile name is gone. A normal-range bar right
-    after still fires. Signals stay non-repainting.
+    2-min whipsaw cluster on a volatile name is gone, and a normal-range bar
+    right after still fires. Past that window the filter is inert — a big
+    midday bar signals normally. Signals stay non-repainting.
 13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺` over the trailing 20
     sessions; the three compose (rate `= W/(W+L)`, `W+L+U` = all closed trades);
     counts fall off as close bars age past 20 sessions; window survives a
