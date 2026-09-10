@@ -150,6 +150,11 @@ int    maxSignalsToTrack = 50            // FIFO cap for the per-module win-rate
                                         // session-windowed — see WINRATE_LOOKBACK_SESSIONS
 bool   showSignalPnL     = true
 bool   showCircles       = true            // trend-flip circles always on
+float  oversizedBarATR   = 2.2             // block entries on a climax/expansion bar:
+                                           // suppress the signal when this bar's range
+                                           // (high - low) exceeds N x ATR(len14). Targets
+                                           // the open-spike whipsaw cluster — chasing a
+                                           // fat bar is a poor entry regardless of score.
 
 // ORB strategy module — retired in the light build. Kept inert
 // (orbEnabled = false) so the router / dashboard / plot code that still
@@ -1527,6 +1532,13 @@ if session_just_opened
 // deliberately left unaffected). maxBarsFromFlip = 0 disables this.
 bool entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip
 
+// Oversized-bar filter — block an entry fired on a climax/expansion bar
+// (range > oversizedBarATR x ATR(len14)). atr is the intraday tf-scaled
+// ATR (not the daily atr_14); high/low are final on a confirmed bar, so
+// this stays non-repainting. Condition-based, no fixed cooldown: a clean
+// signal fires the moment bar ranges normalize again.
+bool bar_not_oversized = na(atr) or atr <= 0 or (high - low) <= oversizedBarATR * atr
+
 //----------------------------------------------------------------------
 // STRATEGY MODULES  (regime-router refactor — Phase 2: Trend Pullback + ORB)
 //----------------------------------------------------------------------
@@ -1551,12 +1563,12 @@ bool entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip
 bool tp_long  = false
 bool tp_short = false
 if sigTime == "Trend"
-    tp_long  := in_session and anchor_ready and trendUp   and passes_quality_filter(final_score, minScoreBuy)
-    tp_short := in_session and anchor_ready and trendDown and passes_quality_filter(final_score, minScoreSell)
+    tp_long  := in_session and anchor_ready and bar_not_oversized and trendUp   and passes_quality_filter(final_score, minScoreBuy)
+    tp_short := in_session and anchor_ready and bar_not_oversized and trendDown and passes_quality_filter(final_score, minScoreSell)
 else  // "Score"
-    tp_long  := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bull and
+    tp_long  := in_session and anchor_ready and entry_is_fresh and bar_not_oversized and barstate.isconfirmed and is_bull and
        passes_quality_filter(final_score, minScoreBuy)
-    tp_short := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bear and
+    tp_short := in_session and anchor_ready and entry_is_fresh and bar_not_oversized and barstate.isconfirmed and is_bear and
        passes_quality_filter(final_score, minScoreSell)
 int tp_quality = final_score
 

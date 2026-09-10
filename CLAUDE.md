@@ -31,8 +31,8 @@ Everything else is **auto-tuned** from the asset profile + anchor (see
 [Auto-Tune](#auto-tune)) or **pinned** in the `FIXED BEHAVIOUR` block near the
 top of the file: `showLabels=true`, `sigTime="Score"`, `gateOn=true`,
 `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, `enableSuccessRate=true`,
-`maxSignalsToTrack=50`, `showSignalPnL=true`, `showCircles=true`. There is no
-`showBg` (no `bgcolor()` in this build).
+`maxSignalsToTrack=50`, `showSignalPnL=true`, `showCircles=true`,
+`oversizedBarATR=2.2`. There is no `showBg` (no `bgcolor()` in this build).
 
 **Retired modules:** VWAP Fade is deleted entirely. ORB is inert
 (`orbEnabled=false` constant + 7 tuning constants) — its module/router/dashboard/
@@ -82,8 +82,9 @@ Sequential sections — order matters in Pine Script:
    - **Trend Pullback** (`tp_*`) — the live module: anchor + 5-component
      confluence + quality filter. `sigTime` pinned to `"Score"` (fires off
      `is_bull`/`is_bear` + `entry_is_fresh` + `barstate.isconfirmed`). ANDs in
-     `in_session` and `anchor_ready`. `tp_quality = final_score`. The `"Trend"`
-     mode branch is retained but unreachable.
+     `in_session`, `anchor_ready`, and `bar_not_oversized` (see
+     [Oversized-bar filter](#key-design-decisions)). `tp_quality =
+     final_score`. The `"Trend"` mode branch is retained but unreachable.
    - **ORB** (`orb_*`) — inert.
    - **Router** — `active_strategy`/`strat_long`/`strat_short`/`strat_quality`,
      last-write-wins Trend Pullback → ORB; always resolves to Trend Pullback.
@@ -325,6 +326,17 @@ force-scoring positions at e.g. a lunch break. Not auto-corrected — keep
 (SMA latches on the flip bar; EMA crosses lag). Constrains Score-mode entries via
 `entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip`.
 
+**Oversized-bar filter:** `bar_not_oversized = na(atr) or atr <= 0 or (high -
+low) <= oversizedBarATR × atr` (`oversizedBarATR` pinned `2.2`; `atr` is the
+intraday tf-scaled `ta.atr(len14)`, **not** the daily `atr_14`). AND'd into both
+`tp_long`/`tp_short` branches so a signal fired on a climax/expansion bar is
+suppressed no matter how high its score — an opening-spike bar maxes the
+momentum/volume/ADX components while it prints, so the star filter can't catch
+it. Condition-based, not a cooldown: the next clean bar fires normally once
+ranges normalize. Non-repainting — `high`/`low` are final on the
+`barstate.isconfirmed` bar the Score branch already requires. To retune, edit the
+constant in `FIXED BEHAVIOUR`; there is no panel input.
+
 **Two P&L systems (independent):** *Live dashboard P&L* from `pnl_entry_price`,
 reset on every new signal (strict alternation means entry always = the signal
 that opened the position). *Signal P&L History* on labels, `%` from
@@ -496,6 +508,10 @@ No test runner. After any edit, verify in the Pine Editor:
     outside `tradingHours`.
 12. **Entry freshness:** EMA Cross → no signal >10 bars after a flip; SMA →
     "Bars From Flip" reads `(unlimited)`.
+12b. **Oversized-bar filter:** no BUY/SELL label prints on a bar whose
+    `high - low` exceeds `oversizedBarATR × ta.atr(len14)` (2.2×); the opening
+    2-min whipsaw cluster on a volatile name is gone. A normal-range bar right
+    after still fires. Signals stay non-repainting.
 13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺` over the trailing 20
     sessions; the three compose (rate `= W/(W+L)`, `W+L+U` = all closed trades);
     counts fall off as close bars age past 20 sessions; window survives a
