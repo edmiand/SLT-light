@@ -662,7 +662,16 @@ first nonzero bar), borrow VWAP + RVOL from a liquid tracking ETF.
   Only these set `proxy_family_known` — an unrecognized index (DAX, FTSE, Nikkei)
   falls to the session-TWAP substitute, **not** SPY.
 - **One `request.security`** pulls `[ta.vwap, close, volume, ta.sma(volume,
-  len20)]` with `lookahead_off`. `use_proxy = proxy_eligible and proxy_ok`.
+  len20)]` with `lookahead_off`, called only `if syminfo.type == "index"` —
+  `syminfo.type` is `simple` (fixed per chart, the same class of condition
+  `cvd_tf_ok` uses to gate `request.security_lower_tf`), so this skips the
+  call entirely — not just its result — on the 4 non-index profiles, which
+  never read proxy data anyway (`proxy_eligible` already requires
+  `syminfo.type == "index"`). A compile-perf pass found the call previously
+  ran unconditionally on every symbol, pointing at the chart's own
+  symbol/timeframe for the non-index case "to avoid a foreign feed" — but
+  that still paid the full `request.security` context-switch cost for a
+  result guaranteed unused there. `use_proxy = proxy_eligible and proxy_ok`.
 - **VWAP:** `proxy_vwap_scaled = close * (proxy_vwap / proxy_close)` — proxy's
   fractional deviation at index scale, so C2's math is unchanged. `vwap`
   reassigned once before C2: chart-volume → real `ta.vwap`; volume-less index +

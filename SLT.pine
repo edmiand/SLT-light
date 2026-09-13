@@ -410,17 +410,30 @@ string proxy_ticker = sym_is_ndx ? "NASDAQ:QQQ" : (sym_is_tsx ? "TSX:XIC" : "AME
 // index price units), proxy bar volume, proxy 20-bar volume SMA. lookahead
 // off — same non-repaint contract as the daily ATR request below.
 //
-// The requested symbol is the real proxy ETF ONLY for index-typed charts;
-// every other symbol (stocks / ETFs / futures / forex — where use_proxy is
-// always false, gated by proxy_eligible below) points the call at its own
-// already-loaded series instead of spinning up a foreign data feed on every
-// bar. syminfo.type is constant per chart, so the requested symbol never
-// changes across history.
-string proxy_sec_sym = syminfo.type == "index" ? proxy_ticker : syminfo.tickerid
-[proxy_vwap_raw, proxy_close_raw, proxy_vol_raw, proxy_vol_ma_raw] = request.security(
-     proxy_sec_sym, timeframe.period,
-     [ta.vwap(close), close, volume, ta.sma(volume, len20)],
-     lookahead = barmerge.lookahead_off)
+// syminfo.type is `simple` (fixed for a given chart, the same class of
+// condition cvd_tf_ok uses to gate request.security_lower_tf below), so
+// gating this call itself behind it is safe and skips the call entirely —
+// not just its result — on the 4 non-MARKET-index profiles (stock / ETF /
+// futures / crypto), which are the large majority of charts and never read
+// proxy data (use_proxy is always false there, since proxy_eligible already
+// requires syminfo.type == "index"). Previously this ran unconditionally on
+// every bar, on every symbol, pointing at the chart's own symbol/timeframe
+// for the non-index case to avoid a foreign feed — but that still paid the
+// full request.security context-switch cost for no reason, since the result
+// was already guaranteed unused there.
+float proxy_vwap_raw    = na
+float proxy_close_raw   = na
+float proxy_vol_raw     = na
+float proxy_vol_ma_raw  = na
+if syminfo.type == "index"
+    [pv_vwap, pv_close, pv_vol, pv_volma] = request.security(
+         proxy_ticker, timeframe.period,
+         [ta.vwap(close), close, volume, ta.sma(volume, len20)],
+         lookahead = barmerge.lookahead_off)
+    proxy_vwap_raw   := pv_vwap
+    proxy_close_raw  := pv_close
+    proxy_vol_raw    := pv_vol
+    proxy_vol_ma_raw := pv_volma
 
 bool proxy_eligible = syminfo.type == "index" and not chart_has_volume
 bool proxy_ok       = not na(proxy_vol_ma_raw) and proxy_vol_ma_raw > 0 and
@@ -2154,17 +2167,12 @@ if signal_sell
     last_signal_type := "SELL"
     has_previous_signal := true
 
-// Dashboard "Trade Signal" verdict — tracks only the direction that fired
-// LAST (last_signal_type, just updated above), not both sides at once.
-// Placed after the last_signal_type updates (not up in SUCCESS RATE
-// TRACKING where totalWins_*/totalTrades_* are computed) so a signal firing
-// on THIS bar is picked up immediately rather than lagging a bar behind.
-int   verdict_wins  = last_signal_type == "BUY" ? totalWins_buy : totalWins_sell
-int   verdict_total = last_signal_type == "BUY" ? totalTrades_buy : totalTrades_sell
-// fired = W + L + U for that direction, same window as verdict_total — so
-// trade_verdict's resolution_rate = total / fired is a clean [0,1] ratio.
-int   verdict_fired = last_signal_type == "BUY" ? buy_w + buy_l + buy_u : sell_w + sell_l + sell_u
-[verdict_text, verdict_color] = trade_verdict(verdict_wins, verdict_total, verdict_fired, pnlTarget)
+// Dashboard "Trade Signal" verdict (tracks only the direction that fired
+// LAST, last_signal_type) is computed lazily down in DASHBOARD
+// (barstate.islast, enableSuccessRate only) — trade_verdict() runs
+// wilson_lower_bound() plus several str.tostring calls, and its only
+// consumer is that one dashboard row, so it's kept off the per-bar path the
+// same way the component status-string details are.
 
 //======================================================================
 // UPDATE P&L EXIT TRACKING
@@ -2194,27 +2202,11 @@ if signal_sell
     pnl_entry_bar := bar_index
     day_end_frozen_pnl := na
 
-//======================================================================
-// LIVE P&L TRACKING (DASHBOARD DISPLAY)
-//======================================================================
-// Dashboard P&L reuses current_pnl (P&L EXIT TRACKING above) rather than
-// re-deriving the price move here, so the header always matches exit-signal
-// math exactly — PNL_FRICTION_PCT included, since current_pnl is already net
-// of it. Once day-end-resolved (day_end_frozen_pnl set), the frozen value wins
-// regardless of in_session — the entry's outcome is already permanently
-// scored, so the display must stop drifting with the live/off-hours close.
-float live_pnl_pct = 0.0
-
-if not na(day_end_frozen_pnl)
-    live_pnl_pct := day_end_frozen_pnl
-else if pnl_direction != "NONE" and not na(pnl_entry_price)
-    live_pnl_pct := current_pnl
-else
-    live_pnl_pct := 0.0
-
-string pnl_text = pnl_direction != "NONE" ?
-                  str.format("{0,number,+#.##;-#.##}%", live_pnl_pct) :
-                  "—"
+// LIVE P&L TRACKING (DASHBOARD DISPLAY): live_pnl_pct/pnl_text — the only
+// consumer is the dashboard header — are computed lazily down in DASHBOARD
+// (barstate.islast only), the same "compute on the last bar only" idiom the
+// per-component status strings already use, so the str.format call doesn't
+// run on every historical bar.
 
 //======================================================================
 // DYNAMIC ANCHOR-AWARE VISUAL ELEMENTS
@@ -2423,6 +2415,20 @@ if showDash and barstate.islast
     // displaying last render's (now false) warning. Wipe every row first.
     table.clear(d, 0, 0, 1, DASHBOARD_MAX_ROWS - 1)
 
+    // Live P&L header figure — reuses current_pnl (P&L EXIT TRACKING above)
+    // rather than re-deriving the price move here, so the header always
+    // matches exit-signal math exactly — PNL_FRICTION_PCT included, since
+    // current_pnl is already net of it. Once day-end-resolved
+    // (day_end_frozen_pnl set), the frozen value wins regardless of
+    // in_session — the entry's outcome is already permanently scored, so the
+    // display must stop drifting with the live/off-hours close. Computed
+    // here (last bar only) rather than per-bar since the header is its only
+    // consumer.
+    float live_pnl_pct = not na(day_end_frozen_pnl) ? day_end_frozen_pnl :
+         pnl_direction != "NONE" and not na(pnl_entry_price) ? current_pnl : 0.0
+    string pnl_text = pnl_direction != "NONE" ?
+         str.format("{0,number,+#.##;-#.##}%", live_pnl_pct) : "—"
+
     // Header — no trailing padding: the merged header cell's width already
     // comes from the widest content in the rows below it, and padding text
     // before centering just pushes the visible text left of true-center.
@@ -2489,12 +2495,18 @@ if showDash and barstate.islast
     row += 1
 
     // Trade Signal — verdict for whichever direction fired LAST
-    // (last_signal_type), computed in trade_verdict() up in UPDATE SIGNAL
-    // P&L TRACKING. "—" until any signal has fired at all. Gated on
+    // (last_signal_type). "—" until any signal has fired at all. Gated on
     // enableSuccessRate since the verdict is built from the same resolved
     // win-rate stats (totalWins_*/totalTrades_*) as the BUY/SELL Win Rate
-    // rows below.
+    // rows below. trade_verdict() (wilson_lower_bound + str.tostring calls)
+    // is only ever needed for this one row, so it's called here (last bar
+    // only) instead of on every historical bar.
     if enableSuccessRate
+        int    verdict_wins  = last_signal_type == "BUY" ? totalWins_buy : totalWins_sell
+        int    verdict_total = last_signal_type == "BUY" ? totalTrades_buy : totalTrades_sell
+        int    verdict_fired = last_signal_type == "BUY" ? buy_w + buy_l + buy_u : sell_w + sell_l + sell_u
+        [verdict_text, verdict_color] = trade_verdict(verdict_wins, verdict_total, verdict_fired, pnlTarget)
+
         string trade_signal_display = has_previous_signal ? last_signal_type + " · " + verdict_text : "—"
         color  trade_signal_color   = has_previous_signal ? verdict_color : color.gray
 
