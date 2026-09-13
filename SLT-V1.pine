@@ -1,7 +1,7 @@
 //@version=6
 
 // Version
-string VERSION = "V1.1"
+string VERSION = "V1"
 indicator("SLT " + VERSION, overlay = true, max_labels_count = 300)
 
 // By: @dmandrey
@@ -1553,20 +1553,6 @@ var bool sell_lost_this_entry = false
 var bool buy_entry_open = false
 var bool sell_entry_open = false
 
-// V1.1 — Σ net P&L. Every closed trade (W, L AND U) also lands in one
-// paired session/percentage list per direction, so the dashboard can show
-// the cumulative net % of following every label over the same 20-session
-// window as the win rate. W/L carry the net % the exit resolved at
-// (captured into *_entry_result the bar PROFIT/LOSS fired); a U trade —
-// reversed by the opposite signal before either fired — carries the net
-// move to that reversal bar's close, the loss the win rate alone hides.
-var array<int>   buy_all_s  = array.new<int>()
-var array<float> buy_all_p  = array.new<float>()
-var array<int>   sell_all_s = array.new<int>()
-var array<float> sell_all_p = array.new<float>()
-var float buy_entry_result  = na
-var float sell_entry_result = na
-
 // Front-trim a session-seq bucket to the rolling window. Mutates `a` in
 // place — an array passed by reference is fair game inside a UDF (same as
 // record_module() below). One unconditional front-trim (no full scan) is
@@ -1583,24 +1569,6 @@ trim_window(buy_unr_s,   winrate_cutoff)
 trim_window(sell_win_s,  winrate_cutoff)
 trim_window(sell_loss_s, winrate_cutoff)
 trim_window(sell_unr_s,  winrate_cutoff)
-
-// Paired variant for the Σ lists — shifts the % list in step with its
-// session stamps so the two never drift apart.
-trim_pair(array<int> s, array<float> p, int cutoff) =>
-    while array.size(s) > 0 and array.get(s, 0) <= cutoff
-        array.shift(s)
-        array.shift(p)
-trim_pair(buy_all_s,  buy_all_p,  winrate_cutoff)
-trim_pair(sell_all_s, sell_all_p, winrate_cutoff)
-
-// Sum of one Σ list (read on the last bar by the dashboard)
-sum_pnl(array<float> p) =>
-    float s = 0.0
-    int n = array.size(p)
-    if n > 0
-        for i = 0 to n - 1
-            s += nz(array.get(p, i), 0.0)
-    s
 
 int buy_w  = array.size(buy_win_s)
 int buy_l  = array.size(buy_loss_s)
@@ -1764,14 +1732,9 @@ if session_just_opened
                 record_module(mod_results, strat_id(buy_entry_strategy), true, false, maxSignalsToTrack)
             else
                 array.push(buy_unr_s, session_seq)
-            // Σ: a carried-over entry either resolved (result captured) or
-            // never had exposure (opened on the final bar) -> 0.
-            array.push(buy_all_s, session_seq)
-            array.push(buy_all_p, nz(buy_entry_result, 0.0))
             buy_entry_open := false
             buy_won_this_entry := false
             buy_lost_this_entry := false
-            buy_entry_result := na
         if sell_entry_open
             if sell_won_this_entry
                 array.push(sell_win_s, session_seq)
@@ -1781,12 +1744,9 @@ if session_just_opened
                 record_module(mod_results, strat_id(sell_entry_strategy), false, false, maxSignalsToTrack)
             else
                 array.push(sell_unr_s, session_seq)
-            array.push(sell_all_s, session_seq)
-            array.push(sell_all_p, nz(sell_entry_result, 0.0))
             sell_entry_open := false
             sell_won_this_entry := false
             sell_lost_this_entry := false
-            sell_entry_result := na
 
 // Entry freshness constraint — Score mode only (Trend mode fires directly
 // off the flip bar, so it's already as fresh as possible by construction and is
@@ -2073,14 +2033,6 @@ if enableSuccessRate
     if stop_reached and pnl_direction == "SELL"
         sell_lost_this_entry := true
 
-    // Σ: capture the net % the exit resolved at — the same value the
-    // PROFIT/LOSS label shows (day_end_pnl on the day-end path, else
-    // current_pnl, both already net of PNL_FRICTION_PCT).
-    if (target_reached or stop_reached) and pnl_direction == "BUY"
-        buy_entry_result := day_end_close ? day_end_pnl : current_pnl
-    if (target_reached or stop_reached) and pnl_direction == "SELL"
-        sell_entry_result := day_end_close ? day_end_pnl : current_pnl
-
     // The opposite signal closes the prior entry — bucket it now (W/L into
     // the overall window AND the per-module store keyed by the opening
     // module; U into the overall window only — mod_results stays W/L). Every
@@ -2098,15 +2050,9 @@ if enableSuccessRate
             record_module(mod_results, strat_id(buy_entry_strategy), true, false, maxSignalsToTrack)
         else
             array.push(buy_unr_s, session_seq)
-        // Σ: resolved -> captured result; U -> the net move to THIS bar's
-        // close, where the SELL reverses it (pnl_direction is still "BUY"
-        // here, so current_pnl is the BUY's).
-        array.push(buy_all_s, session_seq)
-        array.push(buy_all_p, not na(buy_entry_result) ? buy_entry_result : current_pnl)
         buy_entry_open := false
         buy_won_this_entry := false
         buy_lost_this_entry := false
-        buy_entry_result := na
     if signal_buy and sell_entry_open
         if sell_won_this_entry
             array.push(sell_win_s, session_seq)
@@ -2116,12 +2062,9 @@ if enableSuccessRate
             record_module(mod_results, strat_id(sell_entry_strategy), false, false, maxSignalsToTrack)
         else
             array.push(sell_unr_s, session_seq)
-        array.push(sell_all_s, session_seq)
-        array.push(sell_all_p, not na(sell_entry_result) ? sell_entry_result : current_pnl)
         sell_entry_open := false
         sell_won_this_entry := false
         sell_lost_this_entry := false
-        sell_entry_result := na
 
     // Open the new entry — stamp it with the module the router picked this
     // bar. (Nothing is counted at open now; a trade enters a W/L/U bucket
@@ -2130,13 +2073,11 @@ if enableSuccessRate
         buy_entry_open := true
         buy_won_this_entry := false
         buy_lost_this_entry := false
-        buy_entry_result := na
         buy_entry_strategy := active_strategy
     if signal_sell
         sell_entry_open := true
         sell_won_this_entry := false
         sell_lost_this_entry := false
-        sell_entry_result := na
         sell_entry_strategy := active_strategy
 
 //======================================================================
@@ -2526,22 +2467,12 @@ if showDash and barstate.islast
         // trading sessions (all three bucketed at trade CLOSE). % = W/(W+L);
         // ↺ is same-day reversals that never hit +/-pnlTarget. fired (what the
         // Trade Signal verdict reads) = W + L + U.
-        // V1.1: "· Σ ±x.xx%" = cumulative net % of every closed BUY (W+L+U)
-        // in the window; the row is coloured by the SIGN OF Σ, not the rate —
-        // a 45% rate with a tight stop can be net positive and a 70% rate
-        // with reversal losses net negative.
-        float buy_sum  = sum_pnl(buy_all_p)
-        float sell_sum = sum_pnl(sell_all_p)
-        int   buy_n    = array.size(buy_all_p)
-        int   sell_n   = array.size(sell_all_p)
-
         string buy_rate_display = (totalTrades_buy > 0 ? str.tostring(success_rate_buy, "#.#") + "%" : "—") +
-             "  ·  " + str.tostring(buy_w) + "W " + str.tostring(buy_l) + "L " + str.tostring(buy_u) + "↺" +
-             (buy_n > 0 ? "  ·  Σ " + str.tostring(buy_sum, "+#.##;-#.##") + "%" : "")
+             "  ·  " + str.tostring(buy_w) + "W " + str.tostring(buy_l) + "L " + str.tostring(buy_u) + "↺"
 
-        color buy_rate_color = buy_n == 0 ? color.new(color.gray, 40) :
-                               buy_sum > 0 ? color.lime :
-                               buy_sum == 0 ? color.yellow : color.red
+        color buy_rate_color = totalTrades_buy == 0 ? color.new(color.gray, 40) :
+                               success_rate_buy >= 60 ? color.lime :
+                               success_rate_buy >= 50 ? color.yellow : color.red
 
         table.cell(d, 0, row, "BUY Win Rate",
              text_color = color.white,
@@ -2555,12 +2486,11 @@ if showDash and barstate.islast
         // SELL Win Rate — W / L / U over the trailing WINRATE_LOOKBACK_SESSIONS
         // trading sessions, same construction as the BUY row above.
         string sell_rate_display = (totalTrades_sell > 0 ? str.tostring(success_rate_sell, "#.#") + "%" : "—") +
-             "  ·  " + str.tostring(sell_w) + "W " + str.tostring(sell_l) + "L " + str.tostring(sell_u) + "↺" +
-             (sell_n > 0 ? "  ·  Σ " + str.tostring(sell_sum, "+#.##;-#.##") + "%" : "")
+             "  ·  " + str.tostring(sell_w) + "W " + str.tostring(sell_l) + "L " + str.tostring(sell_u) + "↺"
 
-        color sell_rate_color = sell_n == 0 ? color.new(color.gray, 40) :
-                               sell_sum > 0 ? color.lime :
-                               sell_sum == 0 ? color.yellow : color.red
+        color sell_rate_color = totalTrades_sell == 0 ? color.new(color.gray, 40) :
+                               success_rate_sell >= 60 ? color.lime :
+                               success_rate_sell >= 50 ? color.yellow : color.red
 
         table.cell(d, 0, row, "SELL Win Rate",
              text_color = color.white,

@@ -596,6 +596,22 @@ trading sessions via `trim_window()`. `buy_w`/`buy_l`/`buy_u` = trimmed
 sessions** (`is_new_session`), so weekends don't shrink the window. The numbers
 compose: rate `= W/(W+L)`, resolved `= W+L`, fired `= W+L+U`.
 
+**Σ net P&L (V1.1):** the win rate hides how much a reversed (U) trade
+actually cost, and treats a +1% target and a −1% stop as equal weight. Each
+direction also keeps a paired `buy_all_s` (`array<int>` session stamp) /
+`buy_all_p` (`array<float>` net %) list, pushed at the same two close sites
+as the W/L/U buckets and trimmed in step by `trim_pair()`. The value pushed:
+for W/L, `buy_entry_result` — captured the bar `target_reached`/`stop_reached`
+fired as `day_end_close ? day_end_pnl : current_pnl` (the exact figure the
+PROFIT/LOSS label shows, net of `PNL_FRICTION_PCT`); for U at an
+opposite-signal close, `current_pnl` on that bar (the net move to the
+reversal, while `pnl_direction` still holds the closing trade); for the
+session-open carryover, `nz(result, 0)` (no exposure). `sum_pnl()` sums the
+list on the last bar; the Win Rate rows append `· Σ ±x.xx%` and are coloured
+by the **sign of Σ**, not the rate. Σ is per-trade %, equal size, no
+compounding — a setup-comparison figure, not an account return. The Trade
+Signal verdict is unchanged (still rate-based).
+
 **Trade Signal verdict:** a dashboard row right after Setup Score (deliberately
 *not* grouped with the Win Rate rows), turning the last-fired direction's
 (`last_signal_type`) resolved stats into a plain call. Computed by
@@ -769,10 +785,16 @@ No test runner. After any edit, verify in the Pine Editor:
     row's label shows a trailing 📅 for that session only. A non-earnings
     session, or a non-STOCK profile, behaves exactly as item 12b — no
     widening, no 📅.
-13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺` over the trailing 20
-    sessions; the three compose (rate `= W/(W+L)`, `W+L+U` = all closed trades);
-    counts fall off as close bars age past 20 sessions; window survives a
-    weekend gap unshrunk; grey when `W+L = 0`. No per-module rows.
+13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺  ·  Σ ±x.xx%` over
+    the trailing 20 sessions; the three compose (rate `= W/(W+L)`, `W+L+U` =
+    all closed trades); counts fall off as close bars age past 20 sessions;
+    window survives a weekend gap unshrunk; grey until a trade closes. No
+    per-module rows.
+13b. **Σ (V1.1):** Σ changes only on a close bar, by exactly one trade's net
+    %. A PROFIT +1.0% trade adds +1.00 (already net of friction); a U trade
+    reversed at −0.4% adds −0.40. Row colour follows the sign of Σ: a row can
+    read a 70% rate in red or a 45% rate in green. Σ is absent (`—`-style
+    blank) until the first close; with `enablePnL` off it still accumulates.
 14. **`enablePnL` independence:** turning P&L Exit OFF stops PROFIT/LOSS
     labels + alerts but win rates keep resolving (must NOT collapse to 0%).
 15. **Stale rows:** a gate goes active then clears → the Gate Details rows
@@ -831,6 +853,9 @@ No test runner. After any edit, verify in the Pine Editor:
 
 `SLT.pine`, forked from **SuperLazyTrade V3** with the SuperTrend anchor removed
 entirely. Anchor selection is binary — SMA (default) or EMA Cross. On-chart
-`indicator()` title is `SLT V1` (from `VERSION = "V1"`). The changelog is in
+`indicator()` title is `SLT V1.1` (from `VERSION = "V1.1"`): V1 plus the Σ
+net-P&L figure on the Win Rate rows. `SLT-V1.pine` is the frozen pre-Σ V1
+snapshot. The V2 EMA-pullback rebuild was tried and parked (see HISTORY.md);
+it lives outside the repo. The changelog is in
 **[HISTORY.md](HISTORY.md)** — append new entries at the end, newest last; keep
 this file describing only the current state.
