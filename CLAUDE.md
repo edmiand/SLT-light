@@ -123,11 +123,14 @@ Sequential sections — order matters in Pine Script:
     on `barstate.islast`, `table.clear`ed each render. First data row = active
     anchor + price. Signal Anchor row shows resolved auto values (e.g.
     `SMA (90) auto ±0.20A` or `EMA Cross (9/30) auto`). Win Rate rows read
-    `<rate>%  ·  <W>W <L>L <U>↺`. ATR Fuel, Initial Balance, and CVD Slope rows
-    are in Extended Metrics only — Initial Balance reads `forming (<n>/30m)`
-    while the range is still building, then `<low>-<high>  ·  blocked <n>L
-    <n>S`; CVD Slope reads `n/a (...)` / `warming up (n/len14)` / a `▲`/`▼`
-    `format.volume` reading, orange when Gate 5 is active.
+    `<rate>%  ·  <W>W <L>L <U>↺`, coloured by the win rate. Net P&L (BUY/SELL),
+    ATR Fuel, Initial Balance, and CVD Slope rows are in Extended Metrics
+    only — Net P&L reads `±x.xx%` (V2, the Σ net-P&L figure — see [Σ net
+    P&L](#key-design-decisions)), coloured by its own sign, not the rate;
+    Initial Balance reads `forming (<n>/30m)` while the range is still
+    building, then `<low>-<high>  ·  blocked <n>L <n>S`; CVD Slope reads
+    `n/a (...)` / `warming up (n/len14)` / a `▲`/`▼` `format.volume` reading,
+    orange when Gate 5 is active.
 14. **Alerts** — 4 `alertcondition` calls: `"BUY"`, `"SELL"`, `"PROFIT"`, `"LOSS"`.
 
 ## Scoring Components
@@ -607,10 +610,13 @@ PROFIT/LOSS label shows, net of `PNL_FRICTION_PCT`); for U at an
 opposite-signal close, `current_pnl` on that bar (the net move to the
 reversal, while `pnl_direction` still holds the closing trade); for the
 session-open carryover, `nz(result, 0)` (no exposure). `sum_pnl()` sums the
-list on the last bar; the Win Rate rows append `· Σ ±x.xx%` and are coloured
-by the **sign of Σ**, not the rate. Σ is per-trade %, equal size, no
-compounding — a setup-comparison figure, not an account return. The Trade
-Signal verdict is unchanged (still rate-based).
+list on the last bar. Displayed as two **Net P&L (BUY)** / **Net P&L (SELL)**
+rows in **Extended Metrics** (moved there from the Win Rate rows so the
+always-visible Win Rate rows stay purely rate-colored), coloured by the
+**sign of Σ** — lime above zero, yellow at exactly zero, red below, grey with
+no closed trades yet. Σ is per-trade %, equal size, no compounding — a
+setup-comparison figure, not an account return. The Trade Signal verdict is
+unchanged (still rate-based).
 
 **Trade Signal verdict:** a dashboard row right after Setup Score (deliberately
 *not* grouped with the Win Rate rows), turning the last-fired direction's
@@ -785,16 +791,20 @@ No test runner. After any edit, verify in the Pine Editor:
     row's label shows a trailing 📅 for that session only. A non-earnings
     session, or a non-STOCK profile, behaves exactly as item 12b — no
     widening, no 📅.
-13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺  ·  Σ ±x.xx%` over
-    the trailing 20 sessions; the three compose (rate `= W/(W+L)`, `W+L+U` =
-    all closed trades); counts fall off as close bars age past 20 sessions;
-    window survives a weekend gap unshrunk; grey until a trade closes. No
-    per-module rows.
-13b. **Σ (V2 only):** Σ changes only on a close bar, by exactly one trade's net
-    %. A PROFIT +1.0% trade adds +1.00 (already net of friction); a U trade
-    reversed at −0.4% adds −0.40. Row colour follows the sign of Σ: a row can
-    read a 70% rate in red or a 45% rate in green. Σ is absent (`—`-style
-    blank) until the first close; with `enablePnL` off it still accumulates.
+13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺` over the trailing 20
+    sessions; the three compose (rate `= W/(W+L)`, `W+L+U` = all closed
+    trades); counts fall off as close bars age past 20 sessions; window
+    survives a weekend gap unshrunk; grey until a trade closes; coloured
+    purely by the win rate (≥60% lime, ≥50% yellow, else red). No per-module
+    rows.
+13b. **Σ (V2 only, Extended Metrics):** `Net P&L (BUY)`/`Net P&L (SELL)` rows
+    change only on a close bar, by exactly one trade's net %. A PROFIT +1.0%
+    trade adds +1.00 (already net of friction); a U trade reversed at −0.4%
+    adds −0.40. Row colour follows the SIGN of Σ, independent of the Win Rate
+    row's colour right above it in the main section — e.g. a 70% win rate can
+    show a red Net P&L row, a 45% rate a lime one. Reads `—` (grey) until the
+    first close; with `enablePnL` off it still accumulates. Only visible with
+    Extended Metrics on.
 14. **`enablePnL` independence:** turning P&L Exit OFF stops PROFIT/LOSS
     labels + alerts but win rates keep resolving (must NOT collapse to 0%).
 15. **Stale rows:** a gate goes active then clears → the Gate Details rows
@@ -859,11 +869,11 @@ the Initial Balance rejection filter, CVD Divergence gate (Gate 5), earnings-
 day IB widening, P&L friction cost, VWAP standard-deviation bands, and a
 compile-performance pass that moved per-bar `str.tostring` calls off the hot
 path — frozen as `SLT-V1.pine`. **V2 is everything this file documents**: all
-of the above, plus the Σ net-P&L figure on the Win Rate rows. Concretely, V1
-lacks Gate 5 entirely (only Gates 1-4), has no Initial Balance row, no P&L
-friction subtraction, fixed-% VWAP-distance thresholds only (no σ path), and
-no Σ column — compare it against V2 on the same chart to see what each
-feature actually buys. (A separate single-EMA-anchor rebuild was also tried
+of the above, plus the Σ net-P&L figure (Net P&L rows in Extended Metrics).
+Concretely, V1 lacks Gate 5 entirely (only Gates 1-4), has no Initial Balance
+row, no P&L friction subtraction, fixed-% VWAP-distance thresholds only (no σ
+path), and no Net P&L rows — compare it against V2 on the same chart to see
+what each feature actually buys. (A separate single-EMA-anchor rebuild was also tried
 under the name "V2" earlier this session and parked after live results — see
 HISTORY.md; it was never committed and does not correspond to either file
 here.) The changelog is in

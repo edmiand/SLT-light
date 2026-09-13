@@ -142,8 +142,9 @@ grp_vis = "📊 Dashboard & Visuals"
 showDash = input.bool(true, "Show Dashboard", group = grp_vis,
      tooltip = "Bottom-right metrics table.")
 extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
-     tooltip = "Adds the per-component point breakdown plus the Volatility, ATR Fuel, Bars From Flip and " +
-               "Gate Details rows. The BUY/SELL win-rate + Trade Signal rows show regardless of this setting.")
+     tooltip = "Adds the per-component point breakdown plus the Net P&L (Σ), Volatility, ATR Fuel, " +
+               "Bars From Flip, Initial Balance, CVD Slope, and Gate Details rows. The BUY/SELL win-rate + " +
+               "Trade Signal rows show regardless of this setting.")
 
 // (No index-proxy input — the ETF used to source VWAP/volume for a
 // volume-less cash index is auto-picked by symbol family in the INDEX DATA
@@ -1554,9 +1555,10 @@ var bool buy_entry_open = false
 var bool sell_entry_open = false
 
 // V2-only — Σ net P&L. Every closed trade (W, L AND U) also lands in one
-// paired session/percentage list per direction, so the dashboard can show
-// the cumulative net % of following every label over the same 20-session
-// window as the win rate. W/L carry the net % the exit resolved at
+// paired session/percentage list per direction, so the dashboard's Net P&L
+// rows (Extended Metrics — see DASHBOARD) can show the cumulative net % of
+// following every label over the same 20-session window as the win rate.
+// W/L carry the net % the exit resolved at
 // (captured into *_entry_result the bar PROFIT/LOSS fired); a U trade —
 // reversed by the opposite signal before either fired — carries the net
 // move to that reversal bar's close, the loss the win rate alone hides.
@@ -2525,23 +2527,15 @@ if showDash and barstate.islast
         // BUY Win Rate — W / L / U over the trailing WINRATE_LOOKBACK_SESSIONS
         // trading sessions (all three bucketed at trade CLOSE). % = W/(W+L);
         // ↺ is same-day reversals that never hit +/-pnlTarget. fired (what the
-        // Trade Signal verdict reads) = W + L + U.
-        // V2-only: "· Σ ±x.xx%" = cumulative net % of every closed BUY (W+L+U)
-        // in the window; the row is coloured by the SIGN OF Σ, not the rate —
-        // a 45% rate with a tight stop can be net positive and a 70% rate
-        // with reversal losses net negative.
-        float buy_sum  = sum_pnl(buy_all_p)
-        float sell_sum = sum_pnl(sell_all_p)
-        int   buy_n    = array.size(buy_all_p)
-        int   sell_n   = array.size(sell_all_p)
-
+        // Trade Signal verdict reads) = W + L + U. The Σ net-P&L figure (V2)
+        // lives in Extended Metrics instead of here — see the "Net P&L" rows
+        // below — so this row is colour-coded purely by the win RATE again.
         string buy_rate_display = (totalTrades_buy > 0 ? str.tostring(success_rate_buy, "#.#") + "%" : "—") +
-             "  ·  " + str.tostring(buy_w) + "W " + str.tostring(buy_l) + "L " + str.tostring(buy_u) + "↺" +
-             (buy_n > 0 ? "  ·  Σ " + str.tostring(buy_sum, "+#.##;-#.##") + "%" : "")
+             "  ·  " + str.tostring(buy_w) + "W " + str.tostring(buy_l) + "L " + str.tostring(buy_u) + "↺"
 
-        color buy_rate_color = buy_n == 0 ? color.new(color.gray, 40) :
-                               buy_sum > 0 ? color.lime :
-                               buy_sum == 0 ? color.yellow : color.red
+        color buy_rate_color = totalTrades_buy == 0 ? color.new(color.gray, 40) :
+                               success_rate_buy >= 60 ? color.lime :
+                               success_rate_buy >= 50 ? color.yellow : color.red
 
         table.cell(d, 0, row, "BUY Win Rate",
              text_color = color.white,
@@ -2555,12 +2549,11 @@ if showDash and barstate.islast
         // SELL Win Rate — W / L / U over the trailing WINRATE_LOOKBACK_SESSIONS
         // trading sessions, same construction as the BUY row above.
         string sell_rate_display = (totalTrades_sell > 0 ? str.tostring(success_rate_sell, "#.#") + "%" : "—") +
-             "  ·  " + str.tostring(sell_w) + "W " + str.tostring(sell_l) + "L " + str.tostring(sell_u) + "↺" +
-             (sell_n > 0 ? "  ·  Σ " + str.tostring(sell_sum, "+#.##;-#.##") + "%" : "")
+             "  ·  " + str.tostring(sell_w) + "W " + str.tostring(sell_l) + "L " + str.tostring(sell_u) + "↺"
 
-        color sell_rate_color = sell_n == 0 ? color.new(color.gray, 40) :
-                               sell_sum > 0 ? color.lime :
-                               sell_sum == 0 ? color.yellow : color.red
+        color sell_rate_color = totalTrades_sell == 0 ? color.new(color.gray, 40) :
+                               success_rate_sell >= 60 ? color.lime :
+                               success_rate_sell >= 50 ? color.yellow : color.red
 
         table.cell(d, 0, row, "SELL Win Rate",
              text_color = color.white,
@@ -2600,7 +2593,32 @@ if showDash and barstate.islast
         table.cell(d, 0, row, "─────────────────────", text_color = color.new(color.gray, 60), text_size = size.small)
         table.merge_cells(d, 0, row, 1, row)
         row += 1
-        
+
+        // Net P&L (Σ, V2) — moved here from the Win Rate rows: the cumulative
+        // net % of every closed trade (W, L AND U) in the same 20-session
+        // window, so a reversed (U) trade's cost is counted instead of hidden,
+        // and a +1% target isn't weighted the same as a -1% stop. Coloured by
+        // the SIGN OF Σ, not the win rate — a 45% rate with a tight stop can
+        // be net positive, a 70% rate with reversal losses net negative.
+        float buy_sum  = sum_pnl(buy_all_p)
+        float sell_sum = sum_pnl(sell_all_p)
+        int   buy_n    = array.size(buy_all_p)
+        int   sell_n   = array.size(sell_all_p)
+
+        string buy_sum_display = buy_n > 0 ? str.tostring(buy_sum, "+#.##;-#.##") + "%" : "—"
+        color  buy_sum_color   = buy_n == 0 ? color.new(color.gray, 40) :
+             buy_sum > 0 ? color.lime : buy_sum == 0 ? color.yellow : color.red
+        table.cell(d, 0, row, "Net P&L (BUY)", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, buy_sum_display, text_color = buy_sum_color, text_size = size.small)
+        row += 1
+
+        string sell_sum_display = sell_n > 0 ? str.tostring(sell_sum, "+#.##;-#.##") + "%" : "—"
+        color  sell_sum_color   = sell_n == 0 ? color.new(color.gray, 40) :
+             sell_sum > 0 ? color.lime : sell_sum == 0 ? color.yellow : color.red
+        table.cell(d, 0, row, "Net P&L (SELL)", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
+        table.cell(d, 1, row, sell_sum_display, text_color = sell_sum_color, text_size = size.small)
+        row += 1
+
         // Component Breakdown
         table.cell(d, 0, row, "EMA Cascade", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
         table.cell(d, 1, row, t_status + " (" + str.tostring(t_pts) + ")", text_color = color.white, text_size = size.small)
