@@ -866,7 +866,6 @@ no Σ column — compare it against V2 on the same chart to see what each
 feature actually buys. (A separate single-EMA-anchor rebuild was also tried
 under the name "V2" earlier this session and parked after live results — see
 HISTORY.md; it was never committed and does not correspond to either file
-here.)
-it lives outside the repo. The changelog is in
+here.) The changelog is in
 **[HISTORY.md](HISTORY.md)** — append new entries at the end, newest last; keep
 this file describing only the current state.

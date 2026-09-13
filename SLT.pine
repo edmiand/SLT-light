@@ -1553,7 +1553,7 @@ var bool sell_lost_this_entry = false
 var bool buy_entry_open = false
 var bool sell_entry_open = false
 
-// V1.1 — Σ net P&L. Every closed trade (W, L AND U) also lands in one
+// V2-only — Σ net P&L. Every closed trade (W, L AND U) also lands in one
 // paired session/percentage list per direction, so the dashboard can show
 // the cumulative net % of following every label over the same 20-session
 // window as the win rate. W/L carry the net % the exit resolved at
@@ -2526,7 +2526,7 @@ if showDash and barstate.islast
         // trading sessions (all three bucketed at trade CLOSE). % = W/(W+L);
         // ↺ is same-day reversals that never hit +/-pnlTarget. fired (what the
         // Trade Signal verdict reads) = W + L + U.
-        // V1.1: "· Σ ±x.xx%" = cumulative net % of every closed BUY (W+L+U)
+        // V2-only: "· Σ ±x.xx%" = cumulative net % of every closed BUY (W+L+U)
         // in the window; the row is coloured by the SIGN OF Σ, not the rate —
         // a 45% rate with a tight stop can be net positive and a 70% rate
         // with reversal losses net negative.
