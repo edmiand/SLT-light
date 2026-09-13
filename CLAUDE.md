@@ -14,7 +14,7 @@ test runner: development means editing the `.pine` file and pasting it into
 TradingView's Pine Editor to compile.
 
 Two signal anchors: **SMA** (default) and **EMA Cross**. Carried over from the
-parent: the 5-component scoring engine, 4 risk gates, both P&L tracking systems,
+parent: the 5-component scoring engine, 5 risk gates, both P&L tracking systems,
 win-rate tracking, and the dashboard.
 
 **Light build — minimal input surface.** The panel exposes only:
@@ -32,8 +32,8 @@ Everything else is **auto-tuned** from the asset profile + anchor (see
 top of the file: `showLabels=true`, `sigTime="Score"`, `gateOn=true`,
 `rvolMode="Time-of-Day"`, `rvolLookbackDays=10`, `enableSuccessRate=true`,
 `maxSignalsToTrack=50`, `showSignalPnL=true`, `showCircles=true`,
-`oversizedBarATR=2.2`, `oversizedBarWindowBars=15`. There is no `showBg` (no
-`bgcolor()` in this build).
+`IB_MINUTES=30`, `IB_EARNINGS_MULT=2`, `PNL_FRICTION_PCT=0.05`. There is no
+`showBg` (no `bgcolor()` in this build).
 
 **Retired modules:** VWAP Fade is deleted entirely. ORB is inert
 (`orbEnabled=false` constant + 7 tuning constants) — its module/router/dashboard/
@@ -68,8 +68,12 @@ Sequential sections — order matters in Pine Script:
    volume and a recognized family.
 4. **Core calculations** — EMAs (9, `emaSlow` 20/30, 20 fixed for scoring, 50),
    SMA anchor, VWAP (reassigned once before Component 2 — proxy-scaled or session
-   TWAP for a volume-less index), ATR/RSI(14), ADX(14,14), relative volume
-   (Time-of-Day, fed by `vol_eff`; Rolling 20-bar SMA is the thin-history fallback)
+   TWAP for a volume-less index) plus its standard deviation (`vwap_stdev`,
+   feeds Component 2 — see [VWAP Standard Deviation
+   Bands](#key-design-decisions)), cumulative volume delta (`cvd`, feeds Gate 5 —
+   see [CVD Divergence gate](#key-design-decisions)), ATR/RSI(14), ADX(14,14),
+   relative volume (Time-of-Day, fed by `vol_eff`; Rolling 20-bar SMA is the
+   thin-history fallback)
 5. **Market regime detection** — squeeze (BB(20,2) inside KC(20,1.5×ATR)),
    squeeze release, stretch factor, velocity override (ADX>35 rising 3 bars),
    ATR fuel gauge (session range vs daily ATR-14)
@@ -77,14 +81,15 @@ Sequential sections — order matters in Pine Script:
    `trendDown` unify both anchors; `anchor_line_price`/`anchor_short` unify
    display. `trend_start_price` updated on each flip.
 7. **Scoring engine** — 5 components → `raw_score` (capped 100; 105 max pre-cap)
-8. **Risk gates** — 4 gates → penalties subtract from `final_score` when
-   `gateOn` (pinned `true`); always shown as warnings
+8. **Risk gates** — 5 gates → penalties subtract from `final_score` when
+   `gateOn` (pinned `true`); always shown as warnings. Gate 5 (CVD Divergence)
+   is the one directional gate — see [Risk Gates](#risk-gates)
 9. **Signal generation** — modules → router → dispatch:
    - **Trend Pullback** (`tp_*`) — the live module: anchor + 5-component
      confluence + quality filter. `sigTime` pinned to `"Score"` (fires off
      `is_bull`/`is_bear` + `entry_is_fresh` + `barstate.isconfirmed`). ANDs in
-     `in_session`, `anchor_ready`, and `bar_not_oversized` (see
-     [Oversized-bar filter](#key-design-decisions)). `tp_quality =
+     `in_session`, `anchor_ready`, and `ib_gate_long`/`ib_gate_short` (see
+     [Initial Balance rejection filter](#key-design-decisions)). `tp_quality =
      final_score`. The `"Trend"` mode branch is retained but unreachable.
    - **ORB** (`orb_*`) — inert.
    - **Router** — `active_strategy`/`strat_long`/`strat_short`/`strat_quality`,
@@ -118,7 +123,11 @@ Sequential sections — order matters in Pine Script:
     on `barstate.islast`, `table.clear`ed each render. First data row = active
     anchor + price. Signal Anchor row shows resolved auto values (e.g.
     `SMA (90) auto ±0.20A` or `EMA Cross (9/30) auto`). Win Rate rows read
-    `<rate>%  ·  <W>W <L>L <U>↺`. ATR Fuel row is in Extended Metrics only.
+    `<rate>%  ·  <W>W <L>L <U>↺`. ATR Fuel, Initial Balance, and CVD Slope rows
+    are in Extended Metrics only — Initial Balance reads `forming (<n>/30m)`
+    while the range is still building, then `<low>-<high>  ·  blocked <n>L
+    <n>S`; CVD Slope reads `n/a (...)` / `warming up (n/len14)` / a `▲`/`▼`
+    `format.volume` reading, orange when Gate 5 is active.
 14. **Alerts** — 4 `alertcondition` calls: `"BUY"`, `"SELL"`, `"PROFIT"`, `"LOSS"`.
 
 ## Scoring Components
@@ -140,14 +149,20 @@ are assembled differently per profile — check all five when changing weights.
   selected anchor (`is_bull`/`is_bear`) — it's a directional confluence term.
   Always scores against `ema20`, never `emaSlow`.
 - **C2 — VWAP Value:** by distance from VWAP, correct side — BOUNCE/REJECTION
-  (full, within `0.33 × vwap_h_limit`), HEALTHY (72%, within `vwap_h_limit`),
-  EXTENDED (40%, within `vwap_e_limit`), REVERSION RISK (0, beyond
-  `vwap_e_limit`). Slightly wrong side = GRACE ZONE (20%): bull within
-  `0.2 × vwap_h_limit`, bear within `0.1 ×` (intentionally stricter — short-side
-  entries near VWAP carry more reversion risk); further wrong = WRONG SIDE (0).
-  For a volume-less cash index `vwap` is the proxy's VWAP rescaled to index units,
-  or a session TWAP if no proxy resolves. Volume-less non-index (forex) → `na`,
-  C2 scores 0.
+  (full, within `0.33 × vwap_h`), HEALTHY (72%, within `vwap_h`), EXTENDED
+  (40%, within `vwap_e`), REVERSION RISK (0, beyond `vwap_e`). Slightly wrong
+  side = GRACE ZONE (20%): bull within `0.2 × vwap_h`, bear within `0.1 ×`
+  (intentionally stricter — short-side entries near VWAP carry more reversion
+  risk); further wrong = WRONG SIDE (0). `vwap_h`/`vwap_e` are **standard
+  deviations** (`VWAP_STDEV_HEALTHY`/`VWAP_STDEV_EXTENDED`, 1.0/2.0, shared
+  across all profiles) when a real session-cumulative volume-weighted stdev is
+  available (`vwap_use_stdev`) — the common case for any volume-bearing
+  symbol; **fixed percentages** (`vwap_h_limit`/`vwap_e_limit`, still
+  profile-specific) otherwise. See [VWAP Standard Deviation
+  Bands](#key-design-decisions). For a volume-less cash index `vwap` is the
+  proxy's VWAP rescaled to index units, or a session TWAP if no proxy
+  resolves — both stay on the fixed-% path (no proxy-borrowed stdev yet).
+  Volume-less non-index (forex) → `na`, C2 scores 0.
 - **C3 — Volume Intensity:** 25/20/15/10/5/0 at RVOL ≥2.5/2.0/1.5/1.2/1.0/below.
   RVOL from `vol_eff` (proxy or chart volume); `1.0` fallback (fixed 5 pts) with
   no working proxy.
@@ -180,12 +195,15 @@ are assembled differently per profile — check all five when changing weights.
 | 2 — Stretch | `max(ema_stretch, trend_stretch) > ext_scale`, no velocity override | −10 / −20 |
 | 3 — ATR Fuel | session range > `fuel_max`% of daily ATR-14, no velocity override | −25 |
 | 4 — Liquidity | RVOL < `rvol_gate` AND ADX < 90% of `adx_min` | −25 |
+| 5 — CVD Divergence | trend stance contradicted by the CVD slope over `len14` bars | −20 |
 
 `ema_stretch = |close - ema20| / ATR(14)`, `trend_stretch = |close -
 trend_start_price| / ATR(14)`; extreme tier at `ext_scale × 1.5`. **Velocity
 override** (`is_high_velocity` = ADX > 35 rising 3 bars) waives the Gate 2 *and*
 Gate 3 penalties (still shown as advisory). Component 5B (Squeeze Release) is
-always active regardless of gate mode.
+always active regardless of gate mode. **Gate 5 is directional** (unlike 1-4):
+`gate5_divergence = (is_bull and cvd_slope < 0) or (is_bear and cvd_slope > 0)`
+— see [CVD Divergence gate](#key-design-decisions) for the full mechanics.
 
 ## Profile Parameters Table
 
@@ -197,7 +215,17 @@ restores VWAP + RVOL, forex stays volume-less.
 
 **Scoring / gate thresholds:**
 
-| Profile | `vwap_h_limit` | `vwap_e_limit` | `adx_min` | `rvol_gate` | `ext_scale` | `fuel_max` | `ema_max` | `vwap_max` | `sma_len` |
+`vwap_h_limit`/`vwap_e_limit` below are the **fixed-% fallback only** — active
+when `vwap_use_stdev` is false (a volume-less symbol: proxy-fed index,
+TWAP-fallback index, or forex). Any volume-bearing symbol (the common case for
+every profile) uses the shared `VWAP_STDEV_HEALTHY`/`VWAP_STDEV_EXTENDED`
+(1.0σ/2.0σ) instead — see [VWAP Standard Deviation
+Bands](#key-design-decisions). Notably, each profile's `vwap_e_limit /
+vwap_h_limit` ratio is already ≈2.0 — these percentages were themselves an
+empirical approximation of "roughly 1σ / roughly 2σ" for each asset class
+before a real stdev was available to measure directly.
+
+| Profile | `vwap_h_limit` (fallback) | `vwap_e_limit` (fallback) | `adx_min` | `rvol_gate` | `ext_scale` | `fuel_max` | `ema_max` | `vwap_max` | `sma_len` |
 |---------|------|------|------|------|------|------|------|------|------|
 | MARKET INDEX 🏦 | 0.7% | 1.5% | 25 | 1.0× | 2.0 | 80% | 22 | 23 | 90 |
 | ETF / FUND 📊 | 1.0% | 2.0% | 18 | 1.0× | 2.2 | 75% | 20 | 25 | 90 |
@@ -327,29 +355,173 @@ force-scoring positions at e.g. a lunch break. Not auto-corrected — keep
 (SMA latches on the flip bar; EMA crosses lag). Constrains Score-mode entries via
 `entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip`.
 
-**Oversized-bar filter:** `bar_not_oversized = not in_oversized_window or
-na(atr) or atr <= 0 or (high - low) <= oversizedBarATR × atr` (`oversizedBarATR`
-pinned `2.2`; `atr` is the intraday tf-scaled `ta.atr(len14)`, **not** the daily
-`atr_14`). AND'd into both `tp_long`/`tp_short` branches so a signal fired on a
-climax/expansion bar is suppressed no matter how high its score — an
-opening-spike bar maxes the momentum/volume/ADX components while it prints, so
-the star filter can't catch it. **Scoped to the opening window only:**
-`in_oversized_window = bars_since_open <= oversized_window` where
-`bars_since_open` resets on `session_just_opened` and `oversized_window =
-round(oversizedBarWindowBars × tf_scale)` (`oversizedBarWindowBars` pinned `15`,
-i.e. ~30 min on a 2-min chart). All-day application *degraded* win rate — a
-blocked signal is also a blocked reversal, so a losing position rode through the
-big bar to a worse exit, and legit momentum-continuation entries got cut.
-Condition-based, not a cooldown: inside the window the next clean bar fires
-normally once ranges normalize; outside it the existing gates handle big bars.
-Non-repainting — `high`/`low` are final on the `barstate.isconfirmed` bar the
-Score branch already requires. To retune, edit the two constants in `FIXED
-BEHAVIOUR`; there is no panel input.
+**Initial Balance (IB) rejection filter:** the first `ib_minutes_effective`
+(`IB_MINUTES`, 30, doubled to 60 on an earnings-day STOCK session — see
+[Earnings-day IB widening](#key-design-decisions) below) minutes of each
+session latch a reference range (`ib_high`/`ib_low`), tracked with the
+same extend-then-lock pattern the ORB module uses (`ib_mins < ib_minutes_effective`
+while building, `ib_locked` once closed) but keyed off wall-clock `time` rather
+than a tf-scaled bar count. `ib_up_broken`/`ib_down_broken` latch the first confirmed
+close beyond `ib_high`/`ib_low` each session — only that first poke is guarded:
+`ib_fresh_up_break`/`ib_fresh_down_break` require RVOL ≥ `rvol_gate` (the same
+liquidity bar Gate 4 already applies) via `ib_gate_long`/`ib_gate_short`, ANDed
+into both `tp_long`/`tp_short` branches. An unconfirmed break — price probing
+past the opening range without volume behind it — is exactly the shape that
+tends to fail and reverse intraday; once a side has broken with adequate
+volume, later signals on that side are unaffected (the gate is one-shot per
+session per direction, not a standing filter). Reset on `session_just_opened`
+alongside the other per-session latches. No panel input — retune `IB_MINUTES`
+in `FIXED BEHAVIOUR`. **Observable, not silent:** `tp_long_pre_ib`/
+`tp_short_pre_ib` isolate the condition the module would have fired on absent
+the IB gate, so `ib_blocked_long_count`/`ib_blocked_short_count` (session-reset
+`var int`s) count only genuine blocks — not "didn't qualify anyway" — and
+render as the Initial Balance row in Extended Metrics (see checklist item
+12b). Without this the filter has zero dashboard footprint and there's no way
+to tell whether it ever engages.
+
+**Earnings-day IB widening:** a PEAD-lite addition rather than a standalone
+gate — a hard earnings-day block would throw away legitimate post-earnings
+continuation trades, but the classic gap-and-reverse whipsaw is the same
+failure shape the IB filter already targets, just running longer than a normal
+opening range. `earn_actual = request.earnings(syminfo.tickerid,
+earnings.actual, barmerge.gaps_on, barmerge.lookahead_off)` — `gaps_on` is
+essential here: it returns non-`na` ONLY on the bar where a new earnings
+datapoint is published, `na` otherwise, whereas the default `gaps_off`
+forward-fills and would read non-`na` on every bar after the first-ever
+historical report — useless as an "is TODAY the report day" flag.
+`lookahead_off` keeps it non-repainting. The call itself is gated behind
+`if asset_category == "STOCK"` — `asset_category` is `simple` (fixed for a
+given chart, like `cvd_tf_ok`), so this is safe and skips the call entirely on
+the 4 non-STOCK profiles (a `/code-review` pass caught the first version
+calling it unconditionally every bar with the result simply discarded
+elsewhere, the same "wasted feed" class of issue the compile-perf pass had
+already fixed for the Index Data Proxy). `is_earnings_day` (`var bool`, set
+`true` when `not na(earn_actual)`) naturally covers both release timings
+without special-casing them: a before-market (BMO) report surfaces on the
+`session_just_opened` bar itself (the chart's first bar after publication,
+since `tradingHours` carries no pre-market bars), and an after-the-close (AMC)
+report surfaces on the *next* session's open when the chart shows no extended
+hours — exactly the session each report's reaction actually plays out in.
+**Resets on `session_just_closed`, not `session_just_opened`** — also caught
+in review: if the chart *does* display extended hours, an AMC report's one
+non-`na` bar lands on that off-session post-market bar, before
+`session_just_opened` fires for the next real RTH open; resetting on the
+next open (the original version) would clear the flag on that exact bar
+before the `not na(earn_actual)` check could re-set it (the one non-`na` bar
+has already passed by then), silently losing the widening for precisely the
+session it's meant to cover. Resetting on the *prior* session's close instead
+lets the flag persist correctly across that gap. `ib_minutes_effective =
+is_earnings_day ? IB_MINUTES * IB_EARNINGS_MULT : IB_MINUTES`
+(`IB_EARNINGS_MULT` = 2, so 30 → 60 minutes) feeds the IB extend-while-building
+check in place of the bare constant. Dashboard: the Initial Balance row's
+label gains a trailing 📅 on an earnings session, so a wider-than-usual range
+reads as intentional. No panel input — retune `IB_EARNINGS_MULT` in
+`FIXED BEHAVIOUR`.
+
+**CVD Divergence gate (Gate 5):** approximates aggressive buy/sell pressure
+from OHLCV alone — real bid/ask trade classification isn't available in Pine,
+so each bar is decomposed into its 1-minute constituent bars via
+`request.security_lower_tf(syminfo.tickerid, "1", [close, open, volume])` and
+each sub-bar is classified up-volume (`close > open`) or down-volume
+(`close < open`); summed into `cvd_bar_delta`, then run-summed into a
+session-cumulative `cvd`. `cvd_tf_ok = timeframe.isintraday and not
+timeframe.isseconds and timeframe.multiplier > 1` is `simple` (fixed for a
+given chart), so gating the `request.security_lower_tf` call itself on it is
+safe — the same pattern an `input.bool` toggle would use — and matters here
+specifically because "1" (1 minute) is invalid as a `lower_tf` whenever it
+isn't strictly below the chart's own resolution: a chart at 1 minute or
+coarser is the obvious case, but a **seconds-based chart** (e.g. `"30S"`) also
+has `timeframe.isintraday = true` and `timeframe.multiplier = 30`, so without
+excluding `timeframe.isseconds` explicitly, `cvd_tf_ok` would wrongly pass on
+a chart already finer than 1 minute — a **runtime error**, not just a wasted
+call (caught in a `/code-review` pass after the initial build). `cvd` gets its own
+self-contained session-open reset (`cvd_prev_in_sess`, keyed off the shared
+`th_sess_time`) rather than `session_just_opened`, because `session_just_opened`
+isn't declared until much later in the file (TRADING HOURS SESSION WINDOW) —
+same reason `session_twap` already does this for the TWAP anchor.
+`cvd_slope = cvd - cvd[len14]`, gated by `cvd_slope_ready` (`cvd_eligible and
+cvd_bar_count > len14`) so the lookback never reaches back across a session
+boundary into an unrelated prior session's cumulative value.
+`gate5_divergence = (is_bull and cvd_slope < 0) or (is_bear and cvd_slope >
+0)` — **directional**, unlike Gates 1-4, in the same sense Component 1's
+cascade check is: a bull stance held while aggressive flow has been net
+negative over the lookback (or the reverse for bear) is exactly the
+unconfirmed-move shape prone to a same-day reversal. `cvd_eligible` additionally
+requires `chart_has_volume` (a volume-less index's lower-tf decomposition
+still runs — it's gated on `cvd_tf_ok` only, never on a `series` condition —
+but its volume values are meaningless, so the gate must not trust them).
+**Observable, not silent** (same principle the IB gate uses): a CVD Slope row
+in Extended Metrics distinguishes "n/a (chart ≤1m)" / "n/a (no volume)" /
+"warming up (n/`len14`)" from an actual `▲`/`▼` reading, turning orange the
+moment `gate5_divergence` fires. No panel input — retune `DIVERGENCE_PENALTY`
+(`const int`, top of file) directly.
+
+**VWAP Standard Deviation Bands (Component 2):** distance-from-VWAP scoring
+switches from a fixed percentage to real standard deviations whenever one is
+available. `vwap_sum_pv2`/`vwap_sum_v` (session-cumulative `Σ(volume ×
+close²)` / `Σvolume`, reset on the shared `early_session_just_opened` latch —
+same idiom as TWAP/CVD) give a population variance `E[X²] - E[X]²` around the
+**existing** `vwap` value; `vwap_stdev = sqrt(variance)` when positive, else
+`na`. Deliberately NOT computed via `ta.vwap`'s own banded overload
+(`ta.vwap(source, anchor, mult)`) — that overload takes an explicit anchor and
+computes its *own* VWAP value re-anchored to it, which could subtly diverge
+from the `vwap = ta.vwap(close)` value (implicit exchange-session reset) every
+profile's scoring is already calibrated against; the manual accumulator bolts
+a stdev estimate onto the existing value instead of introducing a second one.
+`vwap_use_stdev = chart_has_volume and not na(vwap_stdev) and vwap_stdev > 0`
+gates which unit Component 2 uses: `vwap_h`/`vwap_e` resolve to
+`VWAP_STDEV_HEALTHY`/`VWAP_STDEV_EXTENDED` (1.0σ/2.0σ, `const float`, shared
+across ALL profiles — not profile-adaptive) when true, or the legacy
+`vwap_h_limit`/`vwap_e_limit` (%, still profile-specific) when false. The tier
+logic itself (BOUNCE/HEALTHY/EXTENDED/REVERSION RISK, GRACE ZONE fractions)
+is completely unchanged — only the unit and the specific threshold values
+change; `vwap_dist` replaces the old `vwap_dist_pct` as the unit-agnostic
+distance measure feeding those same comparisons. **Scoped to real-volume
+symbols only** (`chart_has_volume`): a volume-less index (proxy-fed or
+TWAP-fallback) and forex all stay on the fixed-% path — extending
+stdev-borrowing to the proxy ETF (mirroring how VWAP/RVOL are already
+borrowed there) was scoped out of this pass as materially higher-risk
+(would need a `request.security`-evaluated helper function carrying its own
+`var`-state accumulator in the proxy's context) and left for a future,
+separate change if pursued. **Why not profile-adaptive:** each profile's
+pre-existing `vwap_e_limit / vwap_h_limit` ratio was already ≈2.0 across all
+5 — those percentages were themselves an empirical stand-in for "roughly 1σ /
+roughly 2σ" per asset class; once a symbol's actual volatility is measured
+directly, a single statistical convention applies universally, so
+`VWAP_STDEV_HEALTHY`/`EXTENDED` are `const` rather than assigned per profile
+like every other threshold in the Profile Parameters Table. Dashboard: the
+VWAP Value row's numeric suffix reads `(x.xxσ)` or `(x.xx%)` depending on
+which path is live, so the mode in effect is always visible, not silent.
 
 **Two P&L systems (independent):** *Live dashboard P&L* from `pnl_entry_price`,
 reset on every new signal (strict alternation means entry always = the signal
 that opened the position). *Signal P&L History* on labels, `%` from
 `last_signal_price` using the previous signal's direction — separate state.
+
+**P&L friction cost:** `current_pnl` and `day_end_pnl` both compute via one
+shared `net_pnl_pct(is_buy, entry, px)` function — `raw_pct - PNL_FRICTION_PCT`
+where `raw_pct` is the directional `(px - entry)/entry × 100` (or the mirror
+for a sell) — rather than each inlining its own copy of the formula (a
+`/code-review` pass flagged the original two-inline-copies version as the same
+duplication-risk shape as the `live_pnl_pct` bug below, before either had
+shipped). `PNL_FRICTION_PCT` (0.05, a single conservative generic estimate —
+not profile-scaled) covers the round-trip bid-ask spread + slippage a live
+fill would actually pay. Applied at the source so every consumer — `target_hit`/`stop_hit`,
+`day_end_win_hit`/`day_end_loss_hit`, the win-rate W/L/U buckets they feed, and
+every P&L *display* (dashboard header `PnL <x>%`, day-end PROFIT/LOSS label
+text) — reflects a realistic net outcome without being touched individually.
+Net effect: a raw move now needs `pnlTarget + PNL_FRICTION_PCT` to trigger
+PROFIT (stop triggers `PNL_FRICTION_PCT` sooner), and a position that closes
+exactly flat at day's end correctly resolves as a small loss rather than a
+trivial win. Deliberately scoped to this system only — the separate *Signal
+P&L History* (`signal_pnl`, shown on labels) is purely informational, not used
+for target/stop or win-rate resolution, and is left as a raw price move.
+Fixed a pre-existing duplicate along the way: the dashboard header's
+`live_pnl_pct` re-derived the same raw formula independently instead of
+reusing `current_pnl`, which would have bypassed the friction subtraction
+silently — now reuses `current_pnl` directly (the day-end-frozen branch was
+already correct, since `day_end_frozen_pnl := day_end_pnl`). No panel input —
+retune `PNL_FRICTION_PCT` in `FIXED BEHAVIOUR`.
 
 **P&L exits fire on target/stop, or are forced at day's end:**
 `normal_target_reached`/`normal_stop_reached` fire when `current_pnl` crosses
@@ -460,12 +632,30 @@ first nonzero bar), borrow VWAP + RVOL from a liquid tracking ETF.
   deliberately omit `var` so they reassign every bar.
 - **`request.security`** — always pass `lookahead = barmerge.lookahead_off` and
   the expression directly (no pre-computed `var`).
+- **`request.security_lower_tf`** raises a **runtime error** (not just a wasted
+  call) if its `timeframe` argument isn't strictly lower than the chart's — so
+  a chart already at 1-minute can't request `"1"`. Guarding the call inside
+  `if cvd_tf_ok` is safe specifically because `cvd_tf_ok` is built from `simple`
+  values (`timeframe.isintraday`, `timeframe.multiplier` — fixed for a given
+  chart), the same class of condition an `input.bool` toggle would use to gate
+  a `request.security` call; a `series`-typed condition would need a call in
+  every branch instead.
 - **`na` propagates:** `math.max(na, 0)` is `na`. Guard with `not na(x)` /
   `nz(x, 0)`.
 - **`barstate.isconfirmed`** is true on all historical bars during replay;
   `barstate.islast` only on the most recent. Dashboard uses `islast`, signals use
   `isconfirmed`.
 - **`array.get`** throws out-of-bounds — check `array.size() > 0` first.
+- **`for i = 0 to N`** infers direction from `0`/`N`, it doesn't skip when
+  `0 > N`: an empty array makes `array.size(arr) - 1` equal `-1`, and
+  `for i = 0 to -1` still runs once *descending* (`i = 0`) instead of zero
+  times, then `array.get(arr, 0)` throws on the actually-empty array (hit by
+  the CVD lower-tf loop on bar 0, where `request.security_lower_tf` hasn't
+  returned any sub-bars yet). Wrap any `for i = 0 to array.size(arr) - 1`
+  in `if array.size(arr) > 0` unless the array's non-emptiness is already
+  structurally guaranteed (the `gate_lines`/`words` loops are safe without
+  the guard because `str.split` on a non-empty string always returns ≥ 1
+  token).
 - **`nz()` has no bool overload** (`CE10123`). To default a bool's previous
   value, keep a second `var bool` assigned *before* the update block
   (`sma_prev_bull`). `[1]` on a `var bool` is `na` on bar 0.
@@ -504,25 +694,50 @@ No test runner. After any edit, verify in the Pine Editor:
 6. **No double-count** on a same-bar PROFIT + new signal (increments by 1).
 7. **Gates enforced:** dashboard says `Gates` (not `Risks`); an active gate drops
    `final_score`.
+7b. **Gate 5 (CVD Divergence):** on an intraday chart above 1-minute with real
+    volume, the Extended Metrics CVD Slope row reads `▲`/`▼` plus a
+    `format.volume`-scaled number once `cvd_bar_count > len14`; a bull stance
+    held while it reads `▼` (or bear while `▲`) shows `📉 CVD DIVERGENCE (-20)`
+    in Gate Details and drops `final_score` by 20. On a 1-minute chart or a
+    volume-less symbol the row reads `n/a (...)` and Gate 5 never fires.
 8. **Anchor swap:** SMA → SMA line + grey band, flip circles at latched-state
    changes, `Trend (SMA)`. EMA Cross → EMA9 line, circles at crossover bars,
    `EMA Cross (9/<20|30>) auto`, `maxBarsFromFlip` becomes 10 (SMA = unlimited).
-9. **Dashboard row budget:** worst case (Extended Metrics ON, all 4 gates
+9. **Dashboard row budget:** worst case (Extended Metrics ON, all 5 gates
    active) → no row-overflow error.
 10. **RVOL:** Volume row shows `TOD` on a long chart, `20-bar*` on a short one —
     never `na`.
-11. **P&L target:** PROFIT/LOSS fires at exactly `±pnlTarget %` with static
-    target text; a position still open at the last in-session bar fires
-    `PROFIT/LOSS +<actual%>` with real P&L; no PROFIT/LOSS label ever appears
-    outside `tradingHours`.
+11. **P&L target:** PROFIT/LOSS label text still reads exactly `±pnlTarget %`
+    (static, unaffected by friction); the underlying trigger now needs a raw
+    price move of `pnlTarget + PNL_FRICTION_PCT` (PROFIT) or
+    `-pnlTarget - PNL_FRICTION_PCT`-or-less (LOSS, reached sooner in raw
+    terms) since `current_pnl` is net of friction. A position still open at
+    the last in-session bar fires `PROFIT/LOSS +<actual%>` with real,
+    friction-adjusted P&L; no PROFIT/LOSS label ever appears outside
+    `tradingHours`.
+11b. **P&L friction cost:** the dashboard header's `PnL <x>%` and every
+    PROFIT/LOSS/day-end value are `PNL_FRICTION_PCT` (0.05) lower than the raw
+    price move would give — e.g. a position that closes at the literal entry
+    price at day's end resolves as a small LOSS, not a breakeven/win. The
+    separate Signal P&L History shown on BUY/SELL labels is untouched (still a
+    raw price move) — friction applies only to the live-tracking system that
+    feeds target/stop and win-rate resolution.
 12. **Entry freshness:** EMA Cross → no signal >10 bars after a flip; SMA →
     "Bars From Flip" reads `(unlimited)`.
-12b. **Oversized-bar filter:** within the first `oversizedBarWindowBars` (15,
-    tf-scaled) bars after the open, no BUY/SELL label prints on a bar whose
-    `high - low` exceeds `oversizedBarATR × ta.atr(len14)` (2.2×); the opening
-    2-min whipsaw cluster on a volatile name is gone, and a normal-range bar
-    right after still fires. Past that window the filter is inert — a big
-    midday bar signals normally. Signals stay non-repainting.
+12b. **Initial Balance rejection:** the first confirmed close beyond the
+    first-`IB_MINUTES` (30) range on low RVOL (< `rvol_gate`) fires no
+    BUY/SELL label; a break on adequate RVOL fires normally, and once a side
+    has broken, later same-side signals are unaffected for the rest of the
+    session. Resets at the next `session_just_opened`. Extended Metrics'
+    Initial Balance row confirms the range and increments `blocked <n>L <n>S`
+    the moment the filter actually suppresses a signal — check this row, not
+    just the absence of a label, to confirm the filter is engaging at all.
+12c. **Earnings-day IB widening:** on a STOCK-profile symbol, a session
+    following a fresh earnings report widens the range to `IB_MINUTES ×
+    IB_EARNINGS_MULT` (60 min) instead of the normal 30; the Initial Balance
+    row's label shows a trailing 📅 for that session only. A non-earnings
+    session, or a non-STOCK profile, behaves exactly as item 12b — no
+    widening, no 📅.
 13. **Win rate:** rows read `<rate>%  ·  <W>W <L>L <U>↺` over the trailing 20
     sessions; the three compose (rate `= W/(W+L)`, `W+L+U` = all closed trades);
     counts fall off as close bars age past 20 sessions; window survives a
@@ -554,6 +769,14 @@ No test runner. After any edit, verify in the Pine Editor:
     proportionally; Range/Tick → no error, lengths hold at 2-min values.
 23. **C1 direction follows the anchor** and always scores against `ema20`; its
     status never contradicts the Trend row.
+23b. **VWAP Standard Deviation Bands:** on a volume-bearing symbol (NVDA,
+    SOXX, SPY, QQQ...), the VWAP Value row's numeric suffix reads `(x.xxσ)`,
+    not `%`; tiers (BOUNCE/HEALTHY/EXTENDED/REVERSION RISK/GRACE ZONE) fire at
+    1.0σ/2.0σ boundaries (plus the existing 0.33/0.2/0.1 fractions) regardless
+    of profile. On a volume-less index with a working proxy (e.g. `SPX` →
+    `SPY` data) or the TWAP fallback (`⚠️ volume-less → TWAP`), or on forex,
+    the row still reads `%` against the profile's `vwap_h_limit`/`vwap_e_limit`
+    — unchanged from before this feature.
 24. **Trade Signal verdict:** row right after Setup Score; `—` before any signal;
     switches BUY↔SELL verdict on the same bar the new direction fires;
     `WAIT (n/10)` under 10 resolved; `SKIP (CHOPPY)` when

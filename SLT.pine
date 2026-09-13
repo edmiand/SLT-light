@@ -17,6 +17,21 @@ const int STRETCH_EXTREME_PENALTY = 20    // High extension risk
 const int FUEL_PENALTY = 25
 const int SQUEEZE_PENALTY = 30
 const int LIQUIDITY_PENALTY = 25
+const int DIVERGENCE_PENALTY = 20   // Gate 5: CVD contradicts the trade direction
+
+// VWAP Value (Component 2) standard-deviation tiers — used only when a real
+// (session-cumulative, volume-weighted) stdev is available; see vwap_use_stdev
+// in Component 2. Unlike vwap_h_limit/vwap_e_limit (which vary per asset-class
+// profile), these are NOT profile-adaptive: once distance from VWAP is
+// measured in units of the symbol's OWN actual volatility, one shared
+// statistical convention (1σ / 2σ) applies universally — the per-profile %
+// thresholds were themselves already an empirical approximation of "roughly
+// 1σ" / "roughly 2σ" for each asset class (their extended:healthy ratio is
+// ~2.0 in all 5 profiles), so a real stdev makes the profile-specific tuning
+// redundant for symbols where one is available. See "VWAP Standard Deviation
+// Bands" in Key Design Decisions.
+const float VWAP_STDEV_HEALTHY  = 1.0
+const float VWAP_STDEV_EXTENDED = 2.0
 
 // DASHBOARD
 // Sized to leave headroom before the break guard for the variable-length
@@ -150,17 +165,25 @@ int    maxSignalsToTrack = 50            // FIFO cap for the per-module win-rate
                                         // session-windowed — see WINRATE_LOOKBACK_SESSIONS
 bool   showSignalPnL     = true
 bool   showCircles       = true            // trend-flip circles always on
-float  oversizedBarATR       = 2.2         // block entries on a climax/expansion bar:
-                                           // suppress the signal when this bar's range
-                                           // (high - low) exceeds N x ATR(len14). Targets
-                                           // the open-spike whipsaw cluster — chasing a
-                                           // fat bar is a poor entry regardless of score.
-int    oversizedBarWindowBars = 15         // ...but only for the first N bars after the RTH
-                                           // open (2-min basis, timeframe-scaled at use).
-                                           // Outside that window the existing gates handle
-                                           // big bars; an all-day filter held losing trades
-                                           // open through the reversal bar and cut momentum
-                                           // continuation entries — both hurt the win rate.
+int    IB_MINUTES        = 30              // Initial Balance window: first N minutes of the
+                                           // session define a reference range. A signal firing
+                                           // on the first close beyond that range needs RVOL
+                                           // confirmation (rvol_gate) or it's suppressed — see
+                                           // INITIAL BALANCE TRACKING near SIGNAL GENERATION.
+int    IB_EARNINGS_MULT  = 2               // On a STOCK-profile session where a fresh earnings
+                                           // report just posted, the IB window widens to
+                                           // IB_MINUTES * IB_EARNINGS_MULT — the classic
+                                           // gap-and-reverse whipsaw window runs longer than a
+                                           // normal opening range. See "Earnings-day IB widening"
+                                           // in Key Design Decisions.
+float  PNL_FRICTION_PCT  = 0.05            // Round-trip transaction friction (spread + slippage),
+                                           // subtracted from every P&L calculation so tracked win
+                                           // rates and target/stop hits reflect a realistic net
+                                           // outcome instead of a frictionless raw price move. A
+                                           // single conservative generic estimate — real cost
+                                           // varies by instrument/liquidity — not profile-scaled,
+                                           // consistent with the other FIXED BEHAVIOUR constants.
+                                           // See "P&L friction cost" in Key Design Decisions.
 
 // ORB strategy module — retired in the light build. Kept inert
 // (orbEnabled = false) so the router / dashboard / plot code that still
@@ -188,8 +211,9 @@ string asset_category = switch syminfo.type
 
 // 2. FIX #3: Initialize Threshold Variables WITHOUT 'var'
 // These are simple variables that get assigned once based on profile
-float vwap_h_limit = 1.5   // VWAP Healthy Limit (default)
-float vwap_e_limit = 3.0   // VWAP Extended Limit (default)
+float vwap_h_limit = 1.5   // VWAP Healthy Limit % — fallback ONLY when no real
+                          // stdev is available (see vwap_use_stdev, Component 2)
+float vwap_e_limit = 3.0   // VWAP Extended Limit % — same fallback-only scope
 float adx_min      = 22.0  // ADX Trending Floor (default)
 float rvol_gate    = 0.8   // RVOL Minimum (default)
 float ext_scale    = 2.5   // Overextension ATR Multiplier (default)
@@ -384,8 +408,16 @@ string proxy_ticker = sym_is_ndx ? "NASDAQ:QQQ" : (sym_is_tsx ? "TSX:XIC" : "AME
 // One security call: proxy session VWAP, proxy close (to rescale VWAP into
 // index price units), proxy bar volume, proxy 20-bar volume SMA. lookahead
 // off — same non-repaint contract as the daily ATR request below.
+//
+// The requested symbol is the real proxy ETF ONLY for index-typed charts;
+// every other symbol (stocks / ETFs / futures / forex — where use_proxy is
+// always false, gated by proxy_eligible below) points the call at its own
+// already-loaded series instead of spinning up a foreign data feed on every
+// bar. syminfo.type is constant per chart, so the requested symbol never
+// changes across history.
+string proxy_sec_sym = syminfo.type == "index" ? proxy_ticker : syminfo.tickerid
 [proxy_vwap_raw, proxy_close_raw, proxy_vol_raw, proxy_vol_ma_raw] = request.security(
-     proxy_ticker, timeframe.period,
+     proxy_sec_sym, timeframe.period,
      [ta.vwap(close), close, volume, ta.sma(volume, len20)],
      lookahead = barmerge.lookahead_off)
 
@@ -457,8 +489,11 @@ var float trend_start_price = na  // Price at anchor flip
 // 1. SQUEEZE STATE (Bollinger Bands vs Keltner Channels) — length timeframe-scaled
 [bbU, bbB, bbL] = ta.bb(close, len20, 2.0)
 kc_mult = 1.5
-kcU = bbB + (ta.atr(len20) * kc_mult)
-kcL = bbB - (ta.atr(len20) * kc_mult)
+// ta.atr(len20) is its own stateful series — textual duplicates are NOT
+// common-subexpression-eliminated, so compute it once for both KC bands.
+float atr20 = ta.atr(len20)
+kcU = bbB + (atr20 * kc_mult)
+kcL = bbB - (atr20 * kc_mult)
 
 bool is_squeezing = bbU <= kcU and bbL >= kcL
 bool sqz_release  = not is_squeezing and is_squeezing[1]
@@ -750,20 +785,62 @@ else if is_bear
 // TWAP is anchored to the tradingHours RTH window, NOT is_new_session — a
 // 24h index CFD rolling the calendar day at exchange-midnight would
 // otherwise average ~9h of thin overnight bars into the fair-value line
-// before the cash open. Uses a local time() call because in_session /
-// session_just_opened aren't defined until further below.
-bool  twap_in_sess = not na(time(timeframe.period, tradingHours))
-var bool  twap_prev_in_sess = false
+// before the cash open.
+//
+// th_sess_time is the raw `time(timeframe.period, tradingHours)` series,
+// evaluated ONCE here and reused below by the TRADING HOURS SESSION WINDOW
+// section (in_session / prev_in_session). time(_, session) re-parses the
+// session spec every bar, so folding three calls into one is a measurable
+// per-bar saving. Defined here because the TWAP anchor is the first consumer
+// and sits ahead of the session-window section.
+int  th_sess_time = time(timeframe.period, tradingHours)
+
+// Shared "session just opened" detection for every accumulator below that
+// needs one before session_just_opened itself is declared (much further down,
+// in TRADING HOURS SESSION WINDOW): TWAP, the VWAP stdev band, and CVD all
+// reset on this. Originally TWAP and CVD each kept an independent
+// in-session/prev-in-session var-bool pair computing the exact same
+// condition (flagged in a /code-review pass as duplication risk);
+// consolidated into one shared latch here now that a third consumer needs it.
+bool early_sess_active          = not na(th_sess_time)
+var bool early_sess_prev_active = false
+bool early_session_just_opened  = early_sess_active and not early_sess_prev_active
+early_sess_prev_active := early_sess_active
+
 var float twap_cum = na
 var float twap_n   = na
-if twap_in_sess and not twap_prev_in_sess
+if early_session_just_opened
     twap_cum := 0.0
     twap_n   := 0.0
-twap_prev_in_sess := twap_in_sess
-if twap_in_sess
+if early_sess_active
     twap_cum := nz(twap_cum) + hlc3
     twap_n   := nz(twap_n) + 1
 float session_twap = twap_n > 0 ? twap_cum / twap_n : close
+
+// VWAP STANDARD DEVIATION (feeds Component 2's dynamic bands) — session-
+// cumulative volume-weighted variance around the EXISTING `vwap` value
+// (ta.vwap(close) above), via the same manual accumulator idiom as TWAP/CVD,
+// rather than ta.vwap's own banded overload. That overload takes an explicit
+// anchor argument and would compute its OWN vwap value re-anchored to it,
+// risking a subtle mismatch against the `vwap` every profile's scoring is
+// already calibrated against (ta.vwap(close)'s implicit exchange-session
+// reset) — this bolts a stdev estimate onto the existing value instead of
+// introducing a second one. Population variance: E[X²] - E[X]², X = close
+// weighted by volume, E[X] = vwap. Gated on chart_has_volume: volume-less
+// symbols (proxy-fed index, TWAP-fallback index, or forex) have no real
+// per-trade volume distribution to derive a stdev from, so vwap_stdev stays
+// na for them and Component 2 falls back to the legacy fixed-% thresholds —
+// see vwap_use_stdev there.
+var float vwap_sum_pv2 = 0.0
+var float vwap_sum_v   = 0.0
+if early_session_just_opened
+    vwap_sum_pv2 := 0.0
+    vwap_sum_v   := 0.0
+if barstate.isconfirmed and chart_has_volume
+    vwap_sum_pv2 := vwap_sum_pv2 + volume * math.pow(close, 2)
+    vwap_sum_v   := vwap_sum_v + volume
+float vwap_variance = chart_has_volume and vwap_sum_v > 0 ? (vwap_sum_pv2 / vwap_sum_v) - math.pow(vwap, 2) : na
+float vwap_stdev     = not na(vwap_variance) and vwap_variance > 0 ? math.sqrt(vwap_variance) : na
 
 // Non-index volume-less feeds (e.g. forex) are deliberately left as-is
 // (`vwap` stays the na ta.vwap -> Component 2 inactive, unchanged behaviour);
@@ -771,6 +848,70 @@ float session_twap = twap_n > 0 ? twap_cum / twap_n : close
 vwap := chart_has_volume ? vwap :
      use_proxy and not na(proxy_vwap_scaled) ? proxy_vwap_scaled :
      proxy_eligible ? session_twap : vwap
+
+//======================================================================
+// CUMULATIVE VOLUME DELTA (CVD) — feeds Gate 5 (Divergence)
+//======================================================================
+// Approximates aggressive buy/sell pressure from OHLCV alone: this bar is
+// decomposed into its 1-minute constituent bars via
+// request.security_lower_tf, and each one is classified up-volume
+// (close > open) or down-volume (close < open) — the standard proxy public
+// "volume delta" scripts use in the absence of real bid/ask trade
+// classification. Summed into a per-bar signed delta, then run-summed into
+// a session-cumulative cvd. Resets on the shared early_session_just_opened
+// latch (see "Value reference for Component 2" above) — session_just_opened
+// itself isn't declared until further below, in TRADING HOURS SESSION WINDOW.
+//
+// cvd_tf_ok is `simple` (timeframe.isintraday / timeframe.isseconds /
+// timeframe.multiplier are fixed for a given chart) so gating the
+// request.security_lower_tf call itself on it is safe — the same "skip a
+// security call behind a compile-time-constant condition" pattern an
+// input.bool toggle would use. "1" (1 minute) is invalid as a lower_tf
+// whenever it isn't strictly BELOW the chart's own resolution — true for a
+// chart already at 1 minute or coarser, but also for a SECONDS-based chart
+// (e.g. "30S"): timeframe.isintraday is true there too and
+// timeframe.multiplier is 30 (>1), so without excluding timeframe.isseconds
+// this would pass "1" as a lower_tf on a chart already finer than 1 minute —
+// a runtime error, not just a wasted call. Excluded here so charts that
+// fine-grained (in either direction) get no CVD at all instead of crashing.
+bool cvd_tf_ok = timeframe.isintraday and not timeframe.isseconds and timeframe.multiplier > 1
+
+float cvd_bar_delta = 0.0
+if cvd_tf_ok
+    [cvd_ltf_c, cvd_ltf_o, cvd_ltf_v] = request.security_lower_tf(syminfo.tickerid, "1", [close, open, volume])
+    // Pine infers a for-loop's direction from `from`/`to` rather than
+    // skipping when from > to — an empty array (size 0, e.g. bar 0 before
+    // any lower-tf data exists) makes the bound -1, and `for i = 0 to -1`
+    // still runs once descending instead of zero times. Guard explicitly.
+    if array.size(cvd_ltf_c) > 0
+        for i = 0 to array.size(cvd_ltf_c) - 1
+            float ltf_c = array.get(cvd_ltf_c, i)
+            float ltf_o = array.get(cvd_ltf_o, i)
+            float ltf_v = array.get(cvd_ltf_v, i)
+            cvd_bar_delta += ltf_c > ltf_o ? ltf_v : (ltf_c < ltf_o ? -ltf_v : 0.0)
+
+// cvd_eligible additionally requires real bar volume (chart_has_volume) —
+// on a volume-less index the lower-tf decomposition above still runs (it's
+// gated on cvd_tf_ok only, never on a series condition), but its volume
+// values are meaningless, so Gate 5 must not trust it.
+bool cvd_eligible = cvd_tf_ok and chart_has_volume
+
+var float cvd           = 0.0
+var int   cvd_bar_count = 0
+
+if early_session_just_opened
+    cvd := 0.0
+    cvd_bar_count := 0
+
+if early_sess_active and barstate.isconfirmed
+    cvd := cvd + cvd_bar_delta
+    cvd_bar_count := cvd_bar_count + 1
+
+// Divergence slope over len14 bars — needs the full window inside the
+// CURRENT session or cvd[len14] would reach back across the session-open
+// reset and compare against an unrelated prior-session value.
+bool  cvd_slope_ready = cvd_eligible and cvd_bar_count > len14
+float cvd_slope       = cvd_slope_ready ? cvd - cvd[len14] : na
 
 // COMPONENT 2: VWAP VALUE ANCHOR (profile-adaptive: 20-25 points)
 int v_pts = 0
@@ -782,56 +923,73 @@ int vwap_healthy = math.round(vwap_max * 0.72)
 int vwap_extended = math.round(vwap_max * 0.40)
 int vwap_grace   = math.round(vwap_max * 0.20)
 
-// Calculate distance from VWAP as percentage (with safety check)
-float vwap_dist_pct = 0.0
+// Distance metric: standard deviations of the session's volume-weighted
+// price distribution when one is available (chart_has_volume — the common
+// real-volume STOCK/FUND/FUTURES/CRYPTO case, plus any volume-bearing
+// index), the legacy fixed percentage otherwise (a proxy-fed or
+// TWAP-fallback volume-less index, or forex where Component 2 is already
+// inactive — none of these have a real per-trade volume distribution to
+// derive a stdev from). vwap_h/vwap_e carry whichever unit is live so every
+// tier comparison below is written once and works unchanged either way.
+// vwap_use_stdev/vwap_dist are reused by the dashboard ("σ" vs "%" label) —
+// see checklist item 23b.
+bool  vwap_use_stdev = chart_has_volume and not na(vwap_stdev) and vwap_stdev > 0
+float vwap_h         = vwap_use_stdev ? VWAP_STDEV_HEALTHY  : vwap_h_limit
+float vwap_e         = vwap_use_stdev ? VWAP_STDEV_EXTENDED : vwap_e_limit
+float vwap_dist      = 0.0
 
-// Safety check: Ensure VWAP is valid before calculating
-if not na(vwap) and vwap > 0 and not na(close) and close > 0
-    vwap_dist_pct := math.abs((close - vwap) / vwap) * 100
-    
+// Safety check: Ensure VWAP is valid before calculating. vwap_scoreable is
+// reused by the dashboard, which appends the "(x.xxσ)"/"(x.xx%)" distance to
+// v_status there — kept off the per-bar path so str.tostring(vwap_dist) only
+// runs on the last bar. Between here and the dashboard, v_status holds just
+// the bare tier label.
+bool vwap_scoreable = not na(vwap) and vwap > 0 and not na(close) and close > 0
+if vwap_scoreable
+    vwap_dist := vwap_use_stdev ? math.abs(close - vwap) / vwap_stdev : math.abs((close - vwap) / vwap) * 100
+
     if is_bull
         // Bullish: Want price ABOVE VWAP
-        if close > vwap and vwap_dist_pct <= (vwap_h_limit * 0.33)
+        if close > vwap and vwap_dist <= (vwap_h * 0.33)
             v_pts := vwap_full
-            v_status := "✅ BOUNCE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
-        else if close > vwap and vwap_dist_pct <= vwap_h_limit
+            v_status := "✅ BOUNCE"
+        else if close > vwap and vwap_dist <= vwap_h
             v_pts := vwap_healthy
-            v_status := "✅ HEALTHY (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
-        else if close > vwap and vwap_dist_pct <= vwap_e_limit
+            v_status := "✅ HEALTHY"
+        else if close > vwap and vwap_dist <= vwap_e
             v_pts := vwap_extended
-            v_status := "⚠️ EXTENDED (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+            v_status := "⚠️ EXTENDED"
         else if close > vwap
             v_pts := 0
-            v_status := "🔴 REVERSION RISK (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
-        // Grace zone: bull gets 20% of h_limit tolerance (tighter for short side below)
-        else if close < vwap and vwap_dist_pct <= (vwap_h_limit * 0.2)
+            v_status := "🔴 REVERSION RISK"
+        // Grace zone: bull gets 20% of the healthy threshold's tolerance (tighter for short side below)
+        else if close < vwap and vwap_dist <= (vwap_h * 0.2)
             v_pts := vwap_grace
-            v_status := "⚠️ GRACE ZONE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+            v_status := "⚠️ GRACE ZONE"
         else
             v_pts := 0
-            v_status := "🔴 WRONG SIDE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
-            
+            v_status := "🔴 WRONG SIDE"
+
     else if is_bear
         // Bearish: Want price BELOW VWAP
-        if close < vwap and vwap_dist_pct <= (vwap_h_limit * 0.33)
+        if close < vwap and vwap_dist <= (vwap_h * 0.33)
             v_pts := vwap_full
-            v_status := "✅ REJECTION (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
-        else if close < vwap and vwap_dist_pct <= vwap_h_limit
+            v_status := "✅ REJECTION"
+        else if close < vwap and vwap_dist <= vwap_h
             v_pts := vwap_healthy
-            v_status := "✅ HEALTHY (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
-        else if close < vwap and vwap_dist_pct <= vwap_e_limit
+            v_status := "✅ HEALTHY"
+        else if close < vwap and vwap_dist <= vwap_e
             v_pts := vwap_extended
-            v_status := "⚠️ EXTENDED (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+            v_status := "⚠️ EXTENDED"
         else if close < vwap
             v_pts := 0
-            v_status := "🔴 REVERSION RISK (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
-        // Grace zone: bear gets 10% of h_limit tolerance (stricter than bull's 20%)
-        else if close > vwap and vwap_dist_pct <= (vwap_h_limit * 0.1)
+            v_status := "🔴 REVERSION RISK"
+        // Grace zone: bear gets 10% of the healthy threshold's tolerance (stricter than bull's 20%)
+        else if close > vwap and vwap_dist <= (vwap_h * 0.1)
             v_pts := vwap_grace
-            v_status := "⚠️ GRACE ZONE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+            v_status := "⚠️ GRACE ZONE"
         else
             v_pts := 0
-            v_status := "🔴 WRONG SIDE (" + str.tostring(vwap_dist_pct, "#.##") + "%)"
+            v_status := "🔴 WRONG SIDE"
 else
     // VWAP is invalid (na or zero) - handle gracefully
     v_pts := 0
@@ -864,7 +1022,8 @@ else
 // LIQUIDITY GATE: If volume below threshold, force score cap
 bool volume_is_dead = rel_vol < rvol_threshold
 
-vol_status += " (" + str.tostring(rel_vol, "#.#") + "x " + rvol_mode_label + ")"
+// The "(<rel_vol>x <mode>)" suffix on vol_status is appended by the dashboard
+// (barstate.islast only) so str.tostring stays off the per-bar path.
 
 // COMPONENT 4: ADX TREND STRENGTH (15 points) - PROFILE-ADAPTIVE
 bool adx_rising = adx_rising_2  // 2-bar check for stability
@@ -904,7 +1063,8 @@ else
     a_pts := 0
     a_status := "🔴 CHOPPY"
 
-a_status += " (ADX: " + str.tostring(adx, "#.#") + ")"
+// The " (ADX: <adx>)" suffix on a_status is appended by the dashboard
+// (barstate.islast only) so str.tostring stays off the per-bar path.
 
 // COMPONENT 5: MOMENTUM CONFLUENCE (20 points) - RSI + SQUEEZE
 // MACD sub-component removed: MACD-line sign is ~EMA12>EMA26, a near-duplicate
@@ -967,7 +1127,9 @@ else if r_pts >= 3
 else
     r_status := "🔴 DIVERGING"
 
-r_status += " (RSI: " + str.tostring(rsiVal, "#.#") + " | SQZ: " + sqz_status + ")"
+// The " (RSI: <rsi> | SQZ: <sqz_status>)" suffix on r_status is appended by
+// the dashboard (barstate.islast only) so str.tostring stays off the per-bar
+// path.
 
 
 // CALCULATE RAW SCORE (5 components, max 105 points → capped at 100)
@@ -977,12 +1139,13 @@ raw_score := math.min(raw_score, 100)
 
 
 //======================================================================
-// RISK GATES - CALCULATE ALL 4 GATES
+// RISK GATES - CALCULATE ALL 5 GATES
 //======================================================================
-// Gates 1-4: Applied to final_score (affects signal generation)
+// Gates 1-5: Applied to final_score (affects signal generation)
 // In ADVISORY MODE: All gates shown but not applied
 // In ENFORCEMENT MODE: All gates applied to final_score
-// NOTE: The old Gate 5 (Breakout Bonus) lives in Component 5C instead
+// (The pre-CVD "old Gate 5," a Breakout Bonus, was folded into Component 5C
+// long before this build; Gate 5 below is the CVD Divergence gate.)
 //======================================================================
 
 //----------------------------------------------------------------------
@@ -1038,37 +1201,40 @@ bool gate3_fuel = fuel_exhausted and not is_high_velocity
 bool gate4_liquidity = volume_is_dead and is_choppy
 
 //----------------------------------------------------------------------
+// Gate 5: CVD Divergence (aggressive flow contradicts the trade direction)
+//----------------------------------------------------------------------
+// Directional by construction, like Component 1's cascade check: a bull
+// stance scored while cvd has been net falling over the last len14 bars
+// means price is holding up without aggressive buying behind it (or is
+// being sold into) — exactly the unconfirmed-move shape prone to a same-day
+// reversal. Mirrors for a bear stance with cvd net rising. Inert (false)
+// whenever cvd_slope_ready is false — a volume-less symbol, a chart too
+// fine-grained for the lower-tf decomposition, or still inside the first
+// len14 bars of the session.
+bool gate5_divergence = cvd_slope_ready and
+     ((is_bull and cvd_slope < 0) or (is_bear and cvd_slope > 0))
+
+//----------------------------------------------------------------------
 // Calculate penalty values (for display and application)
 //----------------------------------------------------------------------
 int gate1_penalty = gate1_squeeze ? SQUEEZE_PENALTY : 0
 int gate2_penalty = gate2_stretched ? stretch_penalty : 0  // Tiered stretch penalty (waived under velocity override)
 int gate3_penalty = gate3_fuel ? FUEL_PENALTY : 0
 int gate4_penalty = gate4_liquidity ? LIQUIDITY_PENALTY : 0
+int gate5_penalty = gate5_divergence ? DIVERGENCE_PENALTY : 0
 
-// Build gate message (always visible regardless of gateOn setting)
-string gate_message = ""
-
-if gate1_squeeze
-    gate_message += "🚧 SQUEEZE (-" + str.tostring(gate1_penalty) + ") "
-
-if gate2_raw
-    string stretch_detail = str.tostring(stretch_factor, "#.#") + " ATR"
-    if gate2_overridden
-        gate_message += stretch_status + " (🔥 VELOCITY | " + stretch_detail + ") "
-    else
-        gate_message += stretch_status + " (-" + str.tostring(gate2_penalty) + " | " + stretch_detail + ") "
-
-if gate3_fuel
-    gate_message += "🛑 ATRFUEL (-" + str.tostring(gate3_penalty) + ") "
-
-if gate4_liquidity
-    gate_message += "🚫 LIQUIDITY (-" + str.tostring(gate4_penalty) + ") "
+// The human-readable gate message ("🚧 SQUEEZE (-30) …") is assembled lazily
+// in the dashboard (its only consumer — Extended Metrics, barstate.islast
+// only), so the str.tostring calls that build it don't run on every
+// historical bar. Every input it reads (gate1_squeeze, gate2_raw,
+// gate2_overridden, stretch_status, stretch_factor, gate*_penalty) is a
+// per-bar value computed above and still available at the last bar.
 
 
 //======================================================================
-// RISK GATES - APPLY GATES 1-4 TO FINAL SCORE (ENFORCEMENT MODE ONLY)
+// RISK GATES - APPLY GATES 1-5 TO FINAL SCORE (ENFORCEMENT MODE ONLY)
 //======================================================================
-// Gates 1-4 (pure risk filters)
+// Gates 1-5 (pure risk filters)
 //======================================================================
 int final_score = raw_score
 
@@ -1091,6 +1257,10 @@ if gateOn
     // Gate 4: Liquidity & Strength Circuit Breaker
     if gate4_liquidity
         final_score := math.max(final_score - gate4_penalty, 0)
+
+    // Gate 5: CVD Divergence (aggressive flow contradicts the trade direction)
+    if gate5_divergence
+        final_score := math.max(final_score - gate5_penalty, 0)
 
 // Final Safety Clamp
 final_score := math.max(math.min(final_score, 100), 0)
@@ -1147,8 +1317,10 @@ var bool has_previous_signal = false
 // in_session/prev_in_session alone (it would need to parse tradingHours
 // itself), and multi-range sessions are outside this script's documented use
 // (a single applied window). Keep tradingHours to one range.
-bool in_session       = not na(time(timeframe.period, tradingHours))
-bool prev_in_session   = not na(time(timeframe.period, tradingHours)[1])
+// th_sess_time is the shared `time(timeframe.period, tradingHours)` series,
+// computed once up in "Value reference for Component 2".
+bool in_session       = not na(th_sess_time)
+bool prev_in_session   = not na(th_sess_time[1])
 bool session_just_opened = in_session and not prev_in_session
 
 // Mirrors session_just_opened exactly (same proven in_session/prev_in_session
@@ -1189,12 +1361,25 @@ if session_just_opened
     pnl_entry_bar := na
     day_end_frozen_pnl := na
 
-// Calculate current P&L for exit tracking
+// One formula for net-of-friction P&L, reused by current_pnl and
+// day_end_pnl below — so a future change to the friction model (or a new
+// P&L-deriving site) can't silently update one copy and leave another
+// frictionless, the exact bug shape live_pnl_pct had before it was fixed to
+// reuse current_pnl instead of re-deriving its own raw formula (see "P&L
+// friction cost" in Key Design Decisions).
+net_pnl_pct(bool is_buy, float entry, float px) =>
+    float raw_pct = is_buy ? (px - entry) / entry * 100 : (entry - px) / entry * 100
+    raw_pct - PNL_FRICTION_PCT
+
+// Calculate current P&L for exit tracking. Net of PNL_FRICTION_PCT (round-trip
+// spread + slippage estimate) so target/stop hits, the win-rate buckets they
+// feed, and every P&L display (dashboard header, PROFIT/LOSS labels) reflect
+// a realistic net outcome rather than a frictionless raw price move.
 float current_pnl = 0.0
 if pnl_direction == "BUY" and not na(pnl_entry_price)
-    current_pnl := ((close - pnl_entry_price) / pnl_entry_price) * 100
+    current_pnl := net_pnl_pct(true, pnl_entry_price, close)
 else if pnl_direction == "SELL" and not na(pnl_entry_price)
-    current_pnl := ((pnl_entry_price - close) / pnl_entry_price) * 100
+    current_pnl := net_pnl_pct(false, pnl_entry_price, close)
 
 // Target/stop hit detection — normal, in-session path only.
 bool target_hit = current_pnl >= pnlTarget
@@ -1255,13 +1440,17 @@ bool day_end_trigger  = session_just_closed or day_end_fallback or day_end_onbar
 // to bar_index[1]/close[1]. The onbar path already runs on that final bar, so
 // it reads close and anchors there. Gated on day_end_trigger since it's
 // otherwise read only on that one bar per day.
+// Same net_pnl_pct() helper as current_pnl above — a day-end position that
+// closes exactly flat before cost now correctly resolves as a small loss
+// (day_end_win_hit reads the sign of this value below), matching what a real
+// round-trip would show.
 float day_end_pnl = 0.0
 if day_end_trigger
     float de_px = day_end_onbar ? close : close[1]
     if pnl_direction == "BUY" and not na(pnl_entry_price)
-        day_end_pnl := ((de_px - pnl_entry_price) / pnl_entry_price) * 100
+        day_end_pnl := net_pnl_pct(true, pnl_entry_price, de_px)
     else if pnl_direction == "SELL" and not na(pnl_entry_price)
-        day_end_pnl := ((pnl_entry_price - de_px) / pnl_entry_price) * 100
+        day_end_pnl := net_pnl_pct(false, pnl_entry_price, de_px)
 
 // Requires the entry to have opened before the bar the trigger is resolving —
 // otherwise close/close[1] IS the entry price and day_end_pnl is a trivial,
@@ -1538,19 +1727,91 @@ if session_just_opened
 // deliberately left unaffected). maxBarsFromFlip = 0 disables this.
 bool entry_is_fresh = maxBarsFromFlip <= 0 or bars_since_flip <= maxBarsFromFlip
 
-// Oversized-bar filter — block an entry fired on a climax/expansion bar
-// (range > oversizedBarATR x ATR(len14)), but ONLY within the first
-// oversizedBarWindowBars bars of the RTH session, where the open-spike
-// whipsaw cluster lives. All day it did more harm than good: a blocked
-// signal holds the prior (often losing) trade open until a calm bar, and
-// it also killed legit momentum-continuation entries. atr is the intraday
-// tf-scaled ATR (not the daily atr_14); high/low are final on a confirmed
-// bar, so this stays non-repainting.
-var int bars_since_open = 0
-bars_since_open := session_just_opened ? 0 : bars_since_open + 1
-int  oversized_window     = int(math.max(1.0, math.round(oversizedBarWindowBars * tf_scale)))
-bool in_oversized_window  = bars_since_open <= oversized_window
-bool bar_not_oversized = not in_oversized_window or na(atr) or atr <= 0 or (high - low) <= oversizedBarATR * atr
+// Earnings-day detection (STOCK profile only) — widens the Initial Balance
+// window below for the extra gap/reversal volatility that follows a fresh
+// earnings report. request.earnings with gaps_on returns non-na ONLY on the
+// bar where a new earnings datapoint is actually published, na otherwise —
+// gaps_off (the default) forward-fills, so it would read non-na on every bar
+// after the first-ever historical report, useless as an "is TODAY the report
+// day" flag. lookahead_off keeps this non-repainting: a value can't appear
+// before it was actually known. asset_category is `simple` (fixed for a given
+// chart, like cvd_tf_ok above), so gating the call itself behind it is safe
+// and skips it entirely on the 4 non-STOCK profiles.
+float earn_actual = na
+if asset_category == "STOCK"
+    earn_actual := request.earnings(syminfo.tickerid, earnings.actual, barmerge.gaps_on, barmerge.lookahead_off)
+
+// A pre-market (BMO) report surfaces on the session_just_opened bar itself
+// (the chart's first bar after publication, since tradingHours has no
+// pre-market bars); an after-the-close (AMC) report surfaces on the NEXT
+// session's open when the chart shows no extended hours either — exactly the
+// session each report's reaction actually plays out in. BUT if the chart
+// DOES show extended hours, an AMC report's one non-na earn_actual bar lands
+// on that off-session post-market bar, before session_just_opened fires for
+// the next real RTH open — so the reset must happen at session_just_closed
+// (the end of the PRIOR session), not session_just_opened (the start of the
+// NEXT one), or the flag would be cleared on the very open bar it needs to
+// still be true for, before the "not na(earn_actual)" check even runs (that
+// check finds na again there, since the one non-na bar already passed).
+var bool is_earnings_day = false
+if session_just_closed
+    is_earnings_day := false
+if not na(earn_actual)
+    is_earnings_day := true
+
+// Initial Balance (IB) tracking — first ib_minutes_effective minutes of the
+// session define a reference range (same latch pattern as the ORB module
+// below: extend while inside the window, then lock). A signal firing on the
+// FIRST confirmed close beyond that range this session is an unconfirmed "IB
+// break" — the Gemini research flags this exact shape (a probe beyond the
+// opening range without volume behind it) as prone to same-day
+// rejection/reversal. Require RVOL >= rvol_gate (the same liquidity bar
+// Gate 4 already applies) on that specific bar, or the signal is suppressed;
+// once the break has already latched, later signals on that side are
+// untouched — this only guards the first poke.
+int ib_minutes_effective = is_earnings_day ? IB_MINUTES * IB_EARNINGS_MULT : IB_MINUTES
+
+var float ib_high        = na
+var float ib_low         = na
+var int   ib_open_time   = na
+var bool  ib_locked      = false
+var bool  ib_up_broken   = false
+var bool  ib_down_broken = false
+// Session-reset diagnostic counters — how many times the gate actually
+// blocked a signal that was otherwise ready to fire, surfaced in Extended
+// Metrics so the filter's activity is visible rather than silent.
+var int   ib_blocked_long_count  = 0
+var int   ib_blocked_short_count = 0
+
+if session_just_opened
+    ib_open_time := time
+    ib_high := high
+    ib_low  := low
+    ib_locked := false
+    ib_up_broken := false
+    ib_down_broken := false
+    ib_blocked_long_count := 0
+    ib_blocked_short_count := 0
+
+float ib_mins = not na(ib_open_time) ? (time - ib_open_time) / 60000.0 : na
+
+if barstate.isconfirmed and not na(ib_mins) and not ib_locked
+    if ib_mins < ib_minutes_effective
+        ib_high := math.max(ib_high, high)
+        ib_low  := math.min(ib_low, low)
+    else
+        ib_locked := true
+
+bool ib_fresh_up_break   = ib_locked and not ib_up_broken   and not na(ib_high) and close > ib_high
+bool ib_fresh_down_break = ib_locked and not ib_down_broken and not na(ib_low)  and close < ib_low
+
+if barstate.isconfirmed and ib_fresh_up_break
+    ib_up_broken := true
+if barstate.isconfirmed and ib_fresh_down_break
+    ib_down_broken := true
+
+bool ib_gate_long  = not ib_fresh_up_break   or rel_vol >= rvol_gate
+bool ib_gate_short = not ib_fresh_down_break or rel_vol >= rvol_gate
 
 //----------------------------------------------------------------------
 // STRATEGY MODULES  (regime-router refactor — Phase 2: Trend Pullback + ORB)
@@ -1575,14 +1836,28 @@ bool bar_not_oversized = not in_oversized_window or na(atr) or atr <= 0 or (high
 // carrying barstate.isconfirmed; Score mode checks it explicitly.
 bool tp_long  = false
 bool tp_short = false
+// tp_*_pre_ib isolate the pre-IB-gate condition purely so
+// ib_blocked_long_count/ib_blocked_short_count (Extended Metrics diagnostic —
+// see INITIAL BALANCE TRACKING above) can tell "blocked by the IB filter"
+// apart from "didn't qualify anyway"; tp_long/tp_short themselves still AND
+// in ib_gate_long/ib_gate_short directly.
+bool tp_long_pre_ib  = false
+bool tp_short_pre_ib = false
 if sigTime == "Trend"
-    tp_long  := in_session and anchor_ready and bar_not_oversized and trendUp   and passes_quality_filter(final_score, minScoreBuy)
-    tp_short := in_session and anchor_ready and bar_not_oversized and trendDown and passes_quality_filter(final_score, minScoreSell)
+    tp_long_pre_ib  := in_session and anchor_ready and trendUp   and passes_quality_filter(final_score, minScoreBuy)
+    tp_short_pre_ib := in_session and anchor_ready and trendDown and passes_quality_filter(final_score, minScoreSell)
 else  // "Score"
-    tp_long  := in_session and anchor_ready and entry_is_fresh and bar_not_oversized and barstate.isconfirmed and is_bull and
+    tp_long_pre_ib  := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bull and
        passes_quality_filter(final_score, minScoreBuy)
-    tp_short := in_session and anchor_ready and entry_is_fresh and bar_not_oversized and barstate.isconfirmed and is_bear and
+    tp_short_pre_ib := in_session and anchor_ready and entry_is_fresh and barstate.isconfirmed and is_bear and
        passes_quality_filter(final_score, minScoreSell)
+tp_long  := tp_long_pre_ib  and ib_gate_long
+tp_short := tp_short_pre_ib and ib_gate_short
+
+if tp_long_pre_ib and not ib_gate_long
+    ib_blocked_long_count += 1
+if tp_short_pre_ib and not ib_gate_short
+    ib_blocked_short_count += 1
 int tp_quality = final_score
 
 // --- Module: Opening Range Breakout ---------------------------------------
@@ -1827,19 +2102,18 @@ if signal_sell
 //======================================================================
 // LIVE P&L TRACKING (DASHBOARD DISPLAY)
 //======================================================================
-// Dashboard P&L uses the same entry price as PROFIT/LOSS tracking
-// This ensures consistency between dashboard display and exit signals.
-// Once day-end-resolved (day_end_frozen_pnl set), the frozen value wins
+// Dashboard P&L reuses current_pnl (P&L EXIT TRACKING above) rather than
+// re-deriving the price move here, so the header always matches exit-signal
+// math exactly — PNL_FRICTION_PCT included, since current_pnl is already net
+// of it. Once day-end-resolved (day_end_frozen_pnl set), the frozen value wins
 // regardless of in_session — the entry's outcome is already permanently
 // scored, so the display must stop drifting with the live/off-hours close.
 float live_pnl_pct = 0.0
 
 if not na(day_end_frozen_pnl)
     live_pnl_pct := day_end_frozen_pnl
-else if pnl_direction == "BUY" and not na(pnl_entry_price)
-    live_pnl_pct := ((close - pnl_entry_price) / pnl_entry_price) * 100
-else if pnl_direction == "SELL" and not na(pnl_entry_price)
-    live_pnl_pct := ((pnl_entry_price - close) / pnl_entry_price) * 100
+else if pnl_direction != "NONE" and not na(pnl_entry_price)
+    live_pnl_pct := current_pnl
 else
     live_pnl_pct := 0.0
 
@@ -2043,6 +2317,8 @@ if showDash and barstate.islast
         active_gate_count += 1
     if gate4_liquidity
         active_gate_count += 1
+    if gate5_divergence
+        active_gate_count += 1
 
     var table d = table.new(position.bottom_right, 2, DASHBOARD_MAX_ROWS,
          bgcolor = color.new(color.black, 0), border_width = 1)
@@ -2226,20 +2502,27 @@ if showDash and barstate.islast
         table.cell(d, 1, row, t_status + " (" + str.tostring(t_pts) + ")", text_color = color.white, text_size = size.small)
         row += 1
         
+        // v_status / vol_status / a_status / r_status hold only the bare tier
+        // label between the scoring engine and here — the numeric "(x.xx%)",
+        // "(<rvol>x <mode>)", "(ADX: …)", "(RSI: … | SQZ: …)" detail is
+        // reattached at this point so str.tostring runs on the last bar only.
+        string v_cell = v_status +
+             (vwap_scoreable ? " (" + str.tostring(vwap_dist, "#.##") + (vwap_use_stdev ? "σ)" : "%)") : "") +
+             " (" + str.tostring(v_pts) + ")"
         table.cell(d, 0, row, "VWAP Value", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
-        table.cell(d, 1, row, v_status + " (" + str.tostring(v_pts) + ")", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, row, v_cell, text_color = color.white, text_size = size.small)
         row += 1
-        
+
         table.cell(d, 0, row, "Volume", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
-        table.cell(d, 1, row, vol_status + " (" + str.tostring(vol_pts) + ")", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, row, vol_status + " (" + str.tostring(rel_vol, "#.#") + "x " + rvol_mode_label + ") (" + str.tostring(vol_pts) + ")", text_color = color.white, text_size = size.small)
         row += 1
-        
+
         table.cell(d, 0, row, "ADX Strength", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
-        table.cell(d, 1, row, a_status + " (" + str.tostring(a_pts) + ")", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, row, a_status + " (ADX: " + str.tostring(adx, "#.#") + ") (" + str.tostring(a_pts) + ")", text_color = color.white, text_size = size.small)
         row += 1
-        
+
         table.cell(d, 0, row, "Momentum", text_color = color.gray, text_halign = text.align_left, text_size = size.small)
-        table.cell(d, 1, row, r_status + " (" + str.tostring(r_pts) + ")", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, row, r_status + " (RSI: " + str.tostring(rsiVal, "#.#") + " | SQZ: " + sqz_status + ") (" + str.tostring(r_pts) + ")", text_color = color.white, text_size = size.small)
         row += 1
 
         // ATR Info
@@ -2299,12 +2582,74 @@ if showDash and barstate.islast
              text_size = size.small)
         row += 1
 
-        // Gate Details
+        // Initial Balance — makes the (otherwise silent) IB rejection filter
+        // observable: the locked range plus how many signals it has actually
+        // blocked this session, so "is it doing anything" is answerable from
+        // the chart instead of only from code. Label gains a 📅 marker when
+        // is_earnings_day widened the window this session, so a wider-than-
+        // usual range reads as intentional rather than a bug.
+        int ib_blocked_total = ib_blocked_long_count + ib_blocked_short_count
+        string ib_display = not ib_locked ?
+             "forming (" + str.tostring(math.min(nz(ib_mins, 0), ib_minutes_effective), "#") + "/" + str.tostring(ib_minutes_effective) + "m)" :
+             str.tostring(ib_low, format.mintick) + "-" + str.tostring(ib_high, format.mintick) +
+             "  ·  blocked " + str.tostring(ib_blocked_long_count) + "L " + str.tostring(ib_blocked_short_count) + "S"
+        color ib_color = not ib_locked ? color.gray : (ib_blocked_total > 0 ? color.orange : color.white)
+        string ib_label = "Initial Balance" + (is_earnings_day ? " 📅" : "")
+
+        table.cell(d, 0, row, ib_label,
+             text_color = color.gray,
+             text_halign = text.align_left,
+             text_size = size.small)
+        table.cell(d, 1, row, ib_display,
+             text_color = ib_color,
+             text_size = size.small)
+        row += 1
+
+        // CVD Slope — makes Gate 5 observable the same way the Initial
+        // Balance row does for its gate: the three reasons it can be inert
+        // (chart too fine-grained, volume-less symbol, still warming up this
+        // session) are distinguished from "actively diverging," and the cell
+        // turns orange the moment gate5_divergence is true so it's obvious
+        // this is *why* a signal's score just took a hit.
+        string cvd_display = not cvd_tf_ok ? "n/a (chart ≤1m)" :
+             not chart_has_volume ? "n/a (no volume)" :
+             not cvd_slope_ready ? "warming up (" + str.tostring(cvd_bar_count) + "/" + str.tostring(len14) + ")" :
+             (cvd_slope > 0 ? "▲ " : cvd_slope < 0 ? "▼ " : "— ") + str.tostring(cvd_slope, format.volume)
+        color cvd_color = not cvd_slope_ready ? color.gray : (gate5_divergence ? color.orange : color.white)
+
+        table.cell(d, 0, row, "CVD Slope",
+             text_color = color.gray,
+             text_halign = text.align_left,
+             text_size = size.small)
+        table.cell(d, 1, row, cvd_display,
+             text_color = cvd_color,
+             text_size = size.small)
+        row += 1
+
+        // Gate Details — assemble the message here (moved out of the RISK
+        // GATES section): last-bar + Extended Metrics only, so its str.tostring
+        // calls stay off the per-bar path.
+        string gate_message = ""
+        if gate1_squeeze
+            gate_message += "🚧 SQUEEZE (-" + str.tostring(gate1_penalty) + ") "
+        if gate2_raw
+            string stretch_detail = str.tostring(stretch_factor, "#.#") + " ATR"
+            if gate2_overridden
+                gate_message += stretch_status + " (🔥 VELOCITY | " + stretch_detail + ") "
+            else
+                gate_message += stretch_status + " (-" + str.tostring(gate2_penalty) + " | " + stretch_detail + ") "
+        if gate3_fuel
+            gate_message += "🛑 ATRFUEL (-" + str.tostring(gate3_penalty) + ") "
+        if gate4_liquidity
+            gate_message += "🚫 LIQUIDITY (-" + str.tostring(gate4_penalty) + ") "
+        if gate5_divergence
+            gate_message += "📉 CVD DIVERGENCE (-" + str.tostring(gate5_penalty) + ") "
+
         if gate_message != ""
             array<string> gate_lines = array.new<string>()
             string current_line = ""
             string gate_detail_label = gateOn ? "Gate Details" : "Risk Details"
-            
+
             array<string> words = str.split(gate_message, " ")
             
             for i = 0 to array.size(words) - 1
