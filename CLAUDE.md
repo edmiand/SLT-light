@@ -596,7 +596,7 @@ trading sessions via `trim_window()`. `buy_w`/`buy_l`/`buy_u` = trimmed
 sessions** (`is_new_session`), so weekends don't shrink the window. The numbers
 compose: rate `= W/(W+L)`, resolved `= W+L`, fired `= W+L+U`.
 
-**Σ net P&L (V1.1):** the win rate hides how much a reversed (U) trade
+**Σ net P&L (V2-only, absent in V1):** the win rate hides how much a reversed (U) trade
 actually cost, and treats a +1% target and a −1% stop as equal weight. Each
 direction also keeps a paired `buy_all_s` (`array<int>` session stamp) /
 `buy_all_p` (`array<float>` net %) list, pushed at the same two close sites
@@ -790,7 +790,7 @@ No test runner. After any edit, verify in the Pine Editor:
     all closed trades); counts fall off as close bars age past 20 sessions;
     window survives a weekend gap unshrunk; grey until a trade closes. No
     per-module rows.
-13b. **Σ (V1.1):** Σ changes only on a close bar, by exactly one trade's net
+13b. **Σ (V2 only):** Σ changes only on a close bar, by exactly one trade's net
     %. A PROFIT +1.0% trade adds +1.00 (already net of friction); a U trade
     reversed at −0.4% adds −0.40. Row colour follows the sign of Σ: a row can
     read a 70% rate in red or a 45% rate in green. Σ is absent (`—`-style
@@ -853,9 +853,20 @@ No test runner. After any edit, verify in the Pine Editor:
 
 `SLT.pine`, forked from **SuperLazyTrade V3** with the SuperTrend anchor removed
 entirely. Anchor selection is binary — SMA (default) or EMA Cross. On-chart
-`indicator()` title is `SLT V1.1` (from `VERSION = "V1.1"`): V1 plus the Σ
-net-P&L figure on the Win Rate rows. `SLT-V1.pine` is the frozen pre-Σ V1
-snapshot. The V2 EMA-pullback rebuild was tried and parked (see HISTORY.md);
+`indicator()` title is `SLT V2` (from `VERSION = "V2"`). **V1 was redefined
+(2026-09-13)** to point at an earlier snapshot — the script as it stood before
+the Initial Balance rejection filter, CVD Divergence gate (Gate 5), earnings-
+day IB widening, P&L friction cost, VWAP standard-deviation bands, and a
+compile-performance pass that moved per-bar `str.tostring` calls off the hot
+path — frozen as `SLT-V1.pine`. **V2 is everything this file documents**: all
+of the above, plus the Σ net-P&L figure on the Win Rate rows. Concretely, V1
+lacks Gate 5 entirely (only Gates 1-4), has no Initial Balance row, no P&L
+friction subtraction, fixed-% VWAP-distance thresholds only (no σ path), and
+no Σ column — compare it against V2 on the same chart to see what each
+feature actually buys. (A separate single-EMA-anchor rebuild was also tried
+under the name "V2" earlier this session and parked after live results — see
+HISTORY.md; it was never committed and does not correspond to either file
+here.)
 it lives outside the repo. The changelog is in
 **[HISTORY.md](HISTORY.md)** — append new entries at the end, newest last; keep
 this file describing only the current state.

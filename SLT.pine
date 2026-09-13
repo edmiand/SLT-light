@@ -1,7 +1,7 @@
 //@version=6
 
 // Version
-string VERSION = "V1.1"
+string VERSION = "V2"
 indicator("SLT " + VERSION, overlay = true, max_labels_count = 300)
 
 // By: @dmandrey
