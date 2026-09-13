@@ -804,8 +804,22 @@ int  th_sess_time = time(timeframe.period, tradingHours)
 // consolidated into one shared latch here now that a third consumer needs it.
 bool early_sess_active          = not na(th_sess_time)
 var bool early_sess_prev_active = false
-bool early_session_just_opened  = early_sess_active and not early_sess_prev_active
+bool early_th_session_opened    = early_sess_active and not early_sess_prev_active
 early_sess_prev_active := early_sess_active
+
+// OR'd with is_new_session (calendar-day rollover, already computed above for
+// the daily ATR fuel gauge / TOD RVOL) as a fallback trigger — a /code-review
+// pass caught that a 24h-widened tradingHours (e.g. "0000-2359:1234567", this
+// script's own documented technique for round-the-clock CRYPTO/FUTURES, see
+// checklist item 17) makes in_session/early_sess_active permanently true, so
+// early_th_session_opened alone would fire ONCE at bar 0 and never again —
+// silently turning every accumulator below into a running total over the
+// ENTIRE chart history instead of one session. Harmless to OR in for the
+// normal (non-widened) case: on an RTH-only chart with no extended-hours
+// bars, the calendar day change happens overnight with no bars to evaluate
+// it on, so is_new_session ends up true on the very same bar
+// early_th_session_opened already fires on.
+bool early_session_just_opened  = early_th_session_opened or is_new_session
 
 var float twap_cum = na
 var float twap_n   = na
@@ -831,16 +845,27 @@ float session_twap = twap_n > 0 ? twap_cum / twap_n : close
 // per-trade volume distribution to derive a stdev from, so vwap_stdev stays
 // na for them and Component 2 falls back to the legacy fixed-% thresholds —
 // see vwap_use_stdev there.
-var float vwap_sum_pv2 = 0.0
-var float vwap_sum_v   = 0.0
+var float vwap_sum_pv2      = 0.0
+var float vwap_sum_v        = 0.0
+var int   vwap_sample_count = 0
 if early_session_just_opened
     vwap_sum_pv2 := 0.0
     vwap_sum_v   := 0.0
+    vwap_sample_count := 0
 if barstate.isconfirmed and chart_has_volume
     vwap_sum_pv2 := vwap_sum_pv2 + volume * math.pow(close, 2)
     vwap_sum_v   := vwap_sum_v + volume
+    vwap_sample_count := vwap_sample_count + 1
 float vwap_variance = chart_has_volume and vwap_sum_v > 0 ? (vwap_sum_pv2 / vwap_sum_v) - math.pow(vwap, 2) : na
-float vwap_stdev     = not na(vwap_variance) and vwap_variance > 0 ? math.sqrt(vwap_variance) : na
+// Same minimum-sample-size guard as cvd_slope_ready (cvd_bar_count > len14) —
+// a /code-review pass caught that without one, the first bar or two of every
+// session traded a near-zero-sample variance, so even a tiny price move off
+// VWAP divided down to a wildly inflated sigma count (e.g. "12σ"), pinning
+// Component 2 to REVERSION RISK/WRONG SIDE at the open on every real-volume
+// symbol, every single day — reusing len14 for consistency with CVD's
+// warm-up window rather than inventing a new threshold.
+bool  vwap_stdev_ready = chart_has_volume and vwap_sample_count > len14
+float vwap_stdev       = vwap_stdev_ready and not na(vwap_variance) and vwap_variance > 0 ? math.sqrt(vwap_variance) : na
 
 // Non-index volume-less feeds (e.g. forex) are deliberately left as-is
 // (`vwap` stays the na ta.vwap -> Component 2 inactive, unchanged behaviour);
@@ -932,8 +957,9 @@ int vwap_grace   = math.round(vwap_max * 0.20)
 // derive a stdev from). vwap_h/vwap_e carry whichever unit is live so every
 // tier comparison below is written once and works unchanged either way.
 // vwap_use_stdev/vwap_dist are reused by the dashboard ("σ" vs "%" label) —
-// see checklist item 23b.
-bool  vwap_use_stdev = chart_has_volume and not na(vwap_stdev) and vwap_stdev > 0
+// see checklist item 23b. vwap_stdev_ready (min-sample-size guard, mirrors
+// cvd_slope_ready) already implies chart_has_volume.
+bool  vwap_use_stdev = vwap_stdev_ready and not na(vwap_stdev)
 float vwap_h         = vwap_use_stdev ? VWAP_STDEV_HEALTHY  : vwap_h_limit
 float vwap_e         = vwap_use_stdev ? VWAP_STDEV_EXTENDED : vwap_e_limit
 float vwap_dist      = 0.0
@@ -1805,9 +1831,17 @@ if barstate.isconfirmed and not na(ib_mins) and not ib_locked
 bool ib_fresh_up_break   = ib_locked and not ib_up_broken   and not na(ib_high) and close > ib_high
 bool ib_fresh_down_break = ib_locked and not ib_down_broken and not na(ib_low)  and close < ib_low
 
-if barstate.isconfirmed and ib_fresh_up_break
+// Latch ib_up_broken/ib_down_broken ONLY on an RVOL-CONFIRMED break, not on
+// the mere first attempt — a /code-review pass caught that latching
+// unconditionally here let a low-RVOL fakeout permanently disable the gate
+// for the rest of the session: the very next bar, ib_fresh_up_break is false
+// (already "broken"), so ib_gate_long resolves true unconditionally and any
+// later low-RVOL signal on that side sails through completely unguarded.
+// Requiring rel_vol >= rvol_gate here means a low-RVOL poke stays "fresh" —
+// still gated — until a bar that actually clears the volume bar shows up.
+if barstate.isconfirmed and ib_fresh_up_break and rel_vol >= rvol_gate
     ib_up_broken := true
-if barstate.isconfirmed and ib_fresh_down_break
+if barstate.isconfirmed and ib_fresh_down_break and rel_vol >= rvol_gate
     ib_down_broken := true
 
 bool ib_gate_long  = not ib_fresh_up_break   or rel_vol >= rvol_gate

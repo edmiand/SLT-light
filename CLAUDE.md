@@ -367,9 +367,18 @@ close beyond `ib_high`/`ib_low` each session — only that first poke is guarded
 liquidity bar Gate 4 already applies) via `ib_gate_long`/`ib_gate_short`, ANDed
 into both `tp_long`/`tp_short` branches. An unconfirmed break — price probing
 past the opening range without volume behind it — is exactly the shape that
-tends to fail and reverse intraday; once a side has broken with adequate
-volume, later signals on that side are unaffected (the gate is one-shot per
-session per direction, not a standing filter). Reset on `session_just_opened`
+tends to fail and reverse intraday; once a side has broken **with adequate
+volume**, later signals on that side are unaffected (the gate is one-shot per
+session per direction, not a standing filter). **The latch only fires on an
+RVOL-confirmed break** — `ib_up_broken`/`ib_down_broken` are set only when
+`ib_fresh_up_break`/`ib_fresh_down_break` is true AND `rel_vol >= rvol_gate`
+on that same bar (a `/code-review` pass caught the first version latching on
+ANY first break attempt regardless of outcome: a blocked, low-RVOL fakeout
+still set the latch, so the very next bar `ib_fresh_up_break` was already
+false and `ib_gate_long` resolved unconditionally true — permanently
+disabling the gate for the rest of the session after a single blocked poke).
+A low-RVOL poke now stays "fresh" — still gated — until a bar that actually
+clears the volume bar shows up. Reset on `session_just_opened`
 alongside the other per-session latches. No panel input — retune `IB_MINUTES`
 in `FIXED BEHAVIOUR`. **Observable, not silent:** `tp_long_pre_ib`/
 `tp_short_pre_ib` isolate the condition the module would have fired on absent
@@ -461,15 +470,32 @@ switches from a fixed percentage to real standard deviations whenever one is
 available. `vwap_sum_pv2`/`vwap_sum_v` (session-cumulative `Σ(volume ×
 close²)` / `Σvolume`, reset on the shared `early_session_just_opened` latch —
 same idiom as TWAP/CVD) give a population variance `E[X²] - E[X]²` around the
-**existing** `vwap` value; `vwap_stdev = sqrt(variance)` when positive, else
-`na`. Deliberately NOT computed via `ta.vwap`'s own banded overload
-(`ta.vwap(source, anchor, mult)`) — that overload takes an explicit anchor and
-computes its *own* VWAP value re-anchored to it, which could subtly diverge
-from the `vwap = ta.vwap(close)` value (implicit exchange-session reset) every
-profile's scoring is already calibrated against; the manual accumulator bolts
-a stdev estimate onto the existing value instead of introducing a second one.
-`vwap_use_stdev = chart_has_volume and not na(vwap_stdev) and vwap_stdev > 0`
-gates which unit Component 2 uses: `vwap_h`/`vwap_e` resolve to
+**existing** `vwap` value; `vwap_stdev = sqrt(variance)` when positive AND
+`vwap_stdev_ready` (`vwap_sample_count > len14`, `chart_has_volume` implied —
+mirrors `cvd_slope_ready`'s exact warm-up guard), else `na`. **The warm-up
+guard was added after a `/code-review` pass** caught its absence: without it,
+the first bar or two of every session traded a near-zero-sample variance, so
+even a tiny price move off VWAP divided down to a wildly inflated sigma count
+(e.g. "12σ"), pinning Component 2 to REVERSION RISK/WRONG SIDE at the open on
+every real-volume symbol, every single day. Deliberately NOT computed via
+`ta.vwap`'s own banded overload (`ta.vwap(source, anchor, mult)`) — that
+overload takes an explicit anchor and computes its *own* VWAP value
+re-anchored to it, which could subtly diverge from the `vwap = ta.vwap(close)`
+value (implicit exchange-session reset) every profile's scoring is already
+calibrated against; the manual accumulator bolts a stdev estimate onto the
+existing value instead of introducing a second one. **Reset condition also
+OR's in `is_new_session`** (calendar-day rollover) alongside
+`early_th_session_opened` (the `tradingHours`-derived trigger) — the same
+`/code-review` pass caught that a 24h-widened `tradingHours` (this script's
+own documented technique for round-the-clock CRYPTO/FUTURES, checklist item
+17) makes `in_session` permanently true, so the `tradingHours`-only trigger
+would fire ONCE at bar 0 and never again, turning `vwap_sum_pv2`/`vwap_sum_v`
+into a running total over the ENTIRE chart history while `vwap` itself kept
+resetting daily — a severe E[X²]/E[X] mismatch specifically for the two
+real-volume profiles (CRYPTO/FUTURES) this feature is meant to help. Harmless
+on a normal (non-widened) RTH chart, where the two triggers coincide on the
+same bar. `vwap_use_stdev = vwap_stdev_ready and not na(vwap_stdev)` gates
+which unit Component 2 uses: `vwap_h`/`vwap_e` resolve to
 `VWAP_STDEV_HEALTHY`/`VWAP_STDEV_EXTENDED` (1.0σ/2.0σ, `const float`, shared
 across ALL profiles — not profile-adaptive) when true, or the legacy
 `vwap_h_limit`/`vwap_e_limit` (%, still profile-specific) when false. The tier
@@ -727,8 +753,13 @@ No test runner. After any edit, verify in the Pine Editor:
 12b. **Initial Balance rejection:** the first confirmed close beyond the
     first-`IB_MINUTES` (30) range on low RVOL (< `rvol_gate`) fires no
     BUY/SELL label; a break on adequate RVOL fires normally, and once a side
-    has broken, later same-side signals are unaffected for the rest of the
-    session. Resets at the next `session_just_opened`. Extended Metrics'
+    has broken **with adequate RVOL**, later same-side signals are unaffected
+    for the rest of the session. **Specifically verify the fixed latch
+    behavior:** if a low-RVOL poke past the range gets blocked, the NEXT
+    close still beyond the range must still be gated (checked against RVOL
+    again) rather than sailing through unconditionally — it should take an
+    actual RVOL-confirmed break to release the gate, not just any first
+    attempt. Resets at the next `session_just_opened`. Extended Metrics'
     Initial Balance row confirms the range and increments `blocked <n>L <n>S`
     the moment the filter actually suppresses a signal — check this row, not
     just the absence of a label, to confirm the filter is engaging at all.
@@ -770,13 +801,19 @@ No test runner. After any edit, verify in the Pine Editor:
 23. **C1 direction follows the anchor** and always scores against `ema20`; its
     status never contradicts the Trend row.
 23b. **VWAP Standard Deviation Bands:** on a volume-bearing symbol (NVDA,
-    SOXX, SPY, QQQ...), the VWAP Value row's numeric suffix reads `(x.xxσ)`,
-    not `%`; tiers (BOUNCE/HEALTHY/EXTENDED/REVERSION RISK/GRACE ZONE) fire at
-    1.0σ/2.0σ boundaries (plus the existing 0.33/0.2/0.1 fractions) regardless
-    of profile. On a volume-less index with a working proxy (e.g. `SPX` →
-    `SPY` data) or the TWAP fallback (`⚠️ volume-less → TWAP`), or on forex,
-    the row still reads `%` against the profile's `vwap_h_limit`/`vwap_e_limit`
-    — unchanged from before this feature.
+    SOXX, SPY, QQQ...), the first `len14` bars of each session read `%` (not
+    yet `vwap_stdev_ready`) — no "12σ" spike at the open — then the VWAP Value
+    row's numeric suffix switches to `(x.xxσ)`; tiers (BOUNCE/HEALTHY/
+    EXTENDED/REVERSION RISK/GRACE ZONE) fire at 1.0σ/2.0σ boundaries (plus the
+    existing 0.33/0.2/0.1 fractions) regardless of profile. On a volume-less
+    index with a working proxy (e.g. `SPX` → `SPY` data) or the TWAP fallback
+    (`⚠️ volume-less → TWAP`), or on forex, the row stays on `%` against the
+    profile's `vwap_h_limit`/`vwap_e_limit` for the whole session — unchanged
+    from before this feature. On a CRYPTO/FUTURES chart with `tradingHours`
+    widened to 24h (`"0000-2359:1234567"`), the σ reading should still look
+    sane hours/days into the session (not drifting toward a multi-day/
+    multi-year baseline) — the accumulator resets on the calendar-day
+    rollover as a fallback trigger specifically for this case.
 24. **Trade Signal verdict:** row right after Setup Score; `—` before any signal;
     switches BUY↔SELL verdict on the same bar the new direction fires;
     `WAIT (n/10)` under 10 resolved; `SKIP (CHOPPY)` when
