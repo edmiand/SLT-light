@@ -868,7 +868,7 @@ entirely. Anchor selection is binary — SMA (default) or EMA Cross. On-chart
 the Initial Balance rejection filter, CVD Divergence gate (Gate 5), earnings-
 day IB widening, P&L friction cost, VWAP standard-deviation bands, and a
 compile-performance pass that moved per-bar `str.tostring` calls off the hot
-path — frozen as `SLT-V1.pine`. **V2 is everything this file documents**: all
+path — frozen as `ARCH/SLT-V1.pine`. **V2 is everything this file documents**: all
 of the above, plus the Σ net-P&L figure (Net P&L rows in Extended Metrics).
 Concretely, V1 lacks Gate 5 entirely (only Gates 1-4), has no Initial Balance
 row, no P&L friction subtraction, fixed-% VWAP-distance thresholds only (no σ
@@ -879,3 +879,29 @@ HISTORY.md; it was never committed and does not correspond to either file
 here.) The changelog is in
 **[HISTORY.md](HISTORY.md)** — append new entries at the end, newest last; keep
 this file describing only the current state.
+
+## Versioning Workflow
+
+**`SLT.pine` is the only file Claude edits.** Every session's work — new
+features, fixes, tuning — happens on `SLT.pine` in place, no matter how many
+past versions exist. Never create a second working copy (`SLT-V2.pine`,
+`SLT-new.pine`, etc.) to try something in parallel — that's what caused the
+"two things both called V2" confusion documented in HISTORY.md.
+
+**Archiving a version:** when the user explicitly asks for a new version
+(e.g. "let's start V3" / "archive this as a version"), Claude:
+
+1. Reads the current `VERSION` string in `SLT.pine` to get the sequence
+   number being archived (e.g. `"V2"`).
+2. Copies the current `SLT.pine` byte-for-byte to `ARCH/SLT-V<n>.pine` (git
+   `mv`/`cp` as appropriate — the working file keeps being edited afterward,
+   so this is a copy, not a move).
+3. Bumps `VERSION` in `SLT.pine` to the next sequence number and updates the
+   Version section above + `indicator()` title.
+4. Leaves a HISTORY.md entry noting what the archived snapshot contains, so
+   a future side-by-side comparison (like V1 vs V2 above) has a reference.
+
+Archived snapshots in `ARCH/` are frozen — never edited after archiving. Only
+`SLT.pine` and `ARCH/` (plus the docs) should exist at the top level; don't
+let ad-hoc snapshot files (`SLT-GOOD-FIX.pine`-style) accumulate outside
+`ARCH/`.

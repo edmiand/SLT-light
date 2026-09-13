@@ -11,7 +11,7 @@ regression or a reversed design decision, not implementation difficulty).
 > **Note (2026-09-13):** a single-EMA-anchor rebuild (temporarily also called
 > "V2") shipped items 1–4 and superseded 8–9, but was parked after live
 > results; those items are still open below. Separately, **V1/V2 were then
-> redefined**: `SLT-V1.pine` now points at an earlier snapshot (before the IB
+> redefined**: `ARCH/SLT-V1.pine` now points at an earlier snapshot (before the IB
 > filter, Gate 5, earnings widening, P&L friction, VWAP stdev bands, and the
 > compile-perf pass), and `SLT.pine` (`VERSION = "V2"`) is that snapshot plus
 > all of the above plus the Σ net-P&L column. Items below are scoped to
