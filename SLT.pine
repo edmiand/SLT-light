@@ -1716,7 +1716,10 @@ wilson_lower_bound(int wins, int total) =>
 // - Otherwise, judged on the Wilson-adjusted rate against the same 60/50
 //   tier cutoffs already used for the win-rate row colors: >=60% TRADE,
 //   >=50% CAUTION (thin edge), below SKIP.
-trade_verdict(int wins, int total, int fired, float target) =>
+// Bare verdict only — a per-trade expectancy figure (target * (2*wlb - 1))
+// used to be appended to the TRADE/CAUTION/SKIP tiers, but the user found it
+// confusing/unhelpful and asked for the plain call instead.
+trade_verdict(int wins, int total, int fired) =>
     string verdict = "WAIT"
     color  vcolor  = color.gray
     if total < VERDICT_MIN_SAMPLE
@@ -1729,15 +1732,14 @@ trade_verdict(int wins, int total, int fired, float target) =>
             vcolor := color.red
         else
             float wlb = wilson_lower_bound(wins, total)
-            float ev  = target * (2 * wlb - 1)
             if wlb >= 0.60
-                verdict := "TRADE (" + str.tostring(ev, "#.##") + "%)"
+                verdict := "TRADE"
                 vcolor := color.lime
             else if wlb >= 0.50
-                verdict := "CAUTION (" + str.tostring(ev, "#.##") + "%)"
+                verdict := "CAUTION"
                 vcolor := color.yellow
             else
-                verdict := "SKIP (" + str.tostring(ev, "#.##") + "%)"
+                verdict := "SKIP"
                 vcolor := color.red
     [verdict, vcolor]
 
@@ -2505,7 +2507,7 @@ if showDash and barstate.islast
         int    verdict_wins  = last_signal_type == "BUY" ? totalWins_buy : totalWins_sell
         int    verdict_total = last_signal_type == "BUY" ? totalTrades_buy : totalTrades_sell
         int    verdict_fired = last_signal_type == "BUY" ? buy_w + buy_l + buy_u : sell_w + sell_l + sell_u
-        [verdict_text, verdict_color] = trade_verdict(verdict_wins, verdict_total, verdict_fired, pnlTarget)
+        [verdict_text, verdict_color] = trade_verdict(verdict_wins, verdict_total, verdict_fired)
 
         string trade_signal_display = has_previous_signal ? last_signal_type + " · " + verdict_text : "—"
         color  trade_signal_color   = has_previous_signal ? verdict_color : color.gray

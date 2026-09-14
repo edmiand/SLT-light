@@ -620,17 +620,23 @@ unchanged (still rate-based).
 
 **Trade Signal verdict:** a dashboard row right after Setup Score (deliberately
 *not* grouped with the Win Rate rows), turning the last-fired direction's
-(`last_signal_type`) resolved stats into a plain call. Computed by
-`trade_verdict(wins, total, fired, target)` right after `last_signal_type` is
-updated (so a current-bar signal is reflected immediately). Three gates in order:
+(`last_signal_type`) resolved stats into a plain call — a bare word, no
+appended number. Computed by `trade_verdict(wins, total, fired)` inside the
+dashboard's `barstate.islast` block (moved there in a compile-perf pass — see
+"Pine Script v6 Gotchas"/HISTORY.md — since that's its only consumer; reads
+`last_signal_type` and the win-rate arrays as they stand on the last bar,
+same result as computing it per-bar would have given). Three gates in order:
 1. **Sample size** — `< VERDICT_MIN_SAMPLE` (10) resolved → `WAIT (n/10)`.
 2. **Resolution rate** — `(W+L)/(W+L+U) < VERDICT_MIN_RESOLUTION` (0.40) →
    `SKIP (CHOPPY)`.
 3. **Wilson-adjusted rate** — `wilson_lower_bound(wins, total)` (95%,
    `WILSON_Z = 1.96`) shrinks toward 50% at small `total`, judged against the
    same 60/50 tier cutoffs as the win-rate row colors: ≥60% `TRADE`, ≥50%
-   `CAUTION`, below `SKIP`. Appends per-trade expectancy `target × (2·wlb − 1)`.
-All three thresholds are pinned constants. Row reads `—` until a signal has fired.
+   `CAUTION`, below `SKIP`.
+All three thresholds are pinned constants. Row reads `—` until a signal has
+fired. (A per-trade expectancy figure, `target × (2·wlb − 1)`, used to be
+appended to the TRADE/CAUTION/SKIP tiers — dropped at user request as
+confusing/unhelpful; `trade_verdict()` no longer takes a `target` parameter.)
 
 **Per-module win-rate (Phase 4):** every W/L close also calls `record_module(...)`
 keyed by the module that **opened** the entry (U not tracked per-module).
@@ -858,9 +864,9 @@ No test runner. After any edit, verify in the Pine Editor:
 24. **Trade Signal verdict:** row right after Setup Score; `—` before any signal;
     switches BUY↔SELL verdict on the same bar the new direction fires;
     `WAIT (n/10)` under 10 resolved; `SKIP (CHOPPY)` when
-    `(W+L)/(W+L+U) < 0.40`; otherwise tier by the Wilson-adjusted rate (diverges
-    from the raw rate at small `total`), with a `(±x.xx%)` expectancy;
-    unaffected by `enablePnL`.
+    `(W+L)/(W+L+U) < 0.40`; otherwise a bare `TRADE`/`CAUTION`/`SKIP` tiered by
+    the Wilson-adjusted rate (diverges from the raw rate at small `total`) —
+    no appended number; unaffected by `enablePnL`.
 25. **Index Data Proxy:** volume-less index → Profile row shows the auto-picked
     proxy (`NASDAQ:IXIC` → `· NASDAQ:QQQ data`), Volume row `proxy·TOD`, C2 scores
     non-zero. Unrecognized index (`TVC:DAX`) → orange `· ⚠️ volume-less → TWAP`,
