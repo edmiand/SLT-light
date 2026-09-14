@@ -120,8 +120,14 @@ Sequential sections — order matters in Pine Script:
     ATR buffer band; flip circles; BUY/SELL labels at `anchor_line_price`. ORB
     high/low plot gated off. VWAP fade plots deleted.
 13. **Dashboard** — `table.new` bottom-right, `DASHBOARD_MAX_ROWS = 36`, rendered
-    on `barstate.islast`, `table.clear`ed each render. First data row = active
-    anchor + price. Signal Anchor row shows resolved auto values (e.g.
+    on `barstate.islast`, `table.clear`ed each render. Header reads `SLT
+    <VERSION> · <BUY/SELL> <verdict> | PnL <x%>` once any signal has fired
+    (just `SLT <VERSION> | PnL —` before that) — `<verdict>` is the same
+    Trade Signal verdict word shown in its own row below (see [Trade Signal
+    verdict](#key-design-decisions)). Background stays the plain gray it
+    always was (a verdict-tinted background was tried and reverted — the
+    verdict is only in the title text, not the cell color). First data row = active anchor + price.
+    Signal Anchor row shows resolved auto values (e.g.
     `SMA (90) auto ±0.20A` or `EMA Cross (9/30) auto`). Win Rate rows read
     `<rate>%  ·  <W>W <L>L <U>↺`, coloured by the win rate. Net P&L (BUY/SELL),
     ATR Fuel, Initial Balance, and CVD Slope rows are in Extended Metrics
@@ -637,6 +643,11 @@ All three thresholds are pinned constants. Row reads `—` until a signal has
 fired. (A per-trade expectancy figure, `target × (2·wlb − 1)`, used to be
 appended to the TRADE/CAUTION/SKIP tiers — dropped at user request as
 confusing/unhelpful; `trade_verdict()` no longer takes a `target` parameter.)
+The `trade_verdict()` call itself now happens once, up near `active_gate_count`
+(before `table.new`), rather than down by its own row — `verdict_text`/
+`verdict_color` are computed there and reused unchanged both by the header
+(see Architecture item 13/Dashboard) and by this row, so the same verdict
+never needs computing twice on a render.
 
 **Per-module win-rate (Phase 4):** every W/L close also calls `record_module(...)`
 keyed by the module that **opened** the entry (U not tracked per-module).
@@ -866,7 +877,11 @@ No test runner. After any edit, verify in the Pine Editor:
     `WAIT (n/10)` under 10 resolved; `SKIP (CHOPPY)` when
     `(W+L)/(W+L+U) < 0.40`; otherwise a bare `TRADE`/`CAUTION`/`SKIP` tiered by
     the Wilson-adjusted rate (diverges from the raw rate at small `total`) —
-    no appended number; unaffected by `enablePnL`.
+    no appended number; unaffected by `enablePnL`. Same verdict word also
+    appears in the header title (`SLT <VERSION> · <dir> <verdict> | PnL
+    <x%>`, plain gray background, unchanged) — check both update on the
+    same bar the row does, and that the header reads plain `SLT <VERSION>
+    | PnL —` before any signal has fired.
 25. **Index Data Proxy:** volume-less index → Profile row shows the auto-picked
     proxy (`NASDAQ:IXIC` → `· NASDAQ:QQQ data`), Volume row `proxy·TOD`, C2 scores
     non-zero. Unrecognized index (`TVC:DAX`) → orange `· ⚠️ volume-less → TWAP`,

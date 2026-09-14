@@ -2409,6 +2409,21 @@ if showDash and barstate.islast
     if gate5_divergence
         active_gate_count += 1
 
+    // Trade Signal verdict — computed here (rather than down by its own row)
+    // so the header can show it too. See "Trade Signal verdict" in Key
+    // Design Decisions for the WAIT/SKIP(CHOPPY)/TRADE/CAUTION/SKIP logic;
+    // verdict_text/verdict_color are reused unchanged by the dedicated
+    // Trade Signal row further down.
+    string verdict_text  = ""
+    color  verdict_color = color.gray
+    if enableSuccessRate
+        int verdict_wins  = last_signal_type == "BUY" ? totalWins_buy : totalWins_sell
+        int verdict_total = last_signal_type == "BUY" ? totalTrades_buy : totalTrades_sell
+        int verdict_fired = last_signal_type == "BUY" ? buy_w + buy_l + buy_u : sell_w + sell_l + sell_u
+        [vt, vc] = trade_verdict(verdict_wins, verdict_total, verdict_fired)
+        verdict_text := vt
+        verdict_color := vc
+
     var table d = table.new(position.bottom_right, 2, DASHBOARD_MAX_ROWS,
          bgcolor = color.new(color.black, 0), border_width = 1)
 
@@ -2434,7 +2449,11 @@ if showDash and barstate.islast
     // Header — no trailing padding: the merged header cell's width already
     // comes from the widest content in the rows below it, and padding text
     // before centering just pushes the visible text left of true-center.
-    string header_with_pnl = "SLT " + VERSION + " | PnL " + pnl_text
+    // Background stays the original plain gray regardless of verdict — only
+    // the verdict word itself was added to the title text; a verdict-tinted
+    // background wash was tried and reverted at user request.
+    string header_verdict  = has_previous_signal ? " · " + last_signal_type + " " + verdict_text : ""
+    string header_with_pnl = "SLT " + VERSION + header_verdict + " | PnL " + pnl_text
 
     table.cell(d, 0, 0, header_with_pnl,
         text_color = color.white,
@@ -2500,15 +2519,10 @@ if showDash and barstate.islast
     // (last_signal_type). "—" until any signal has fired at all. Gated on
     // enableSuccessRate since the verdict is built from the same resolved
     // win-rate stats (totalWins_*/totalTrades_*) as the BUY/SELL Win Rate
-    // rows below. trade_verdict() (wilson_lower_bound + str.tostring calls)
-    // is only ever needed for this one row, so it's called here (last bar
-    // only) instead of on every historical bar.
+    // rows below. verdict_text/verdict_color were already computed once,
+    // above, so the header can show the same verdict too — reused here
+    // rather than calling trade_verdict() a second time.
     if enableSuccessRate
-        int    verdict_wins  = last_signal_type == "BUY" ? totalWins_buy : totalWins_sell
-        int    verdict_total = last_signal_type == "BUY" ? totalTrades_buy : totalTrades_sell
-        int    verdict_fired = last_signal_type == "BUY" ? buy_w + buy_l + buy_u : sell_w + sell_l + sell_u
-        [verdict_text, verdict_color] = trade_verdict(verdict_wins, verdict_total, verdict_fired)
-
         string trade_signal_display = has_previous_signal ? last_signal_type + " · " + verdict_text : "—"
         color  trade_signal_color   = has_previous_signal ? verdict_color : color.gray
 
