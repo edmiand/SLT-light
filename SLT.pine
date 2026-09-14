@@ -50,7 +50,7 @@ const int DASHBOARD_MAX_ROWS = 36
 // window, so they compose: fired = W + L + U, rate = W / (W + L).
 const int WINRATE_LOOKBACK_SESSIONS = 20
 
-// Trade-verdict row ("Trade Signal" on the dashboard) — turns the resolved
+// Trade verdict (shown in the dashboard header title) — turns the resolved
 // win rate for whichever direction fired last into a TRADE / CAUTION / SKIP
 // call. VERDICT_MIN_SAMPLE resolved entries are required before a verdict is
 // given at all (small samples default to WAIT). VERDICT_MIN_RESOLUTION is
@@ -119,12 +119,9 @@ sigQuality = input.string("⭐ +", "Score Stars",
 
 grp_pnl = "💰 P&L Exit Signals"
 enablePnL = input.bool(true, "Enable P&L Exit Signals", group = grp_pnl,
-     tooltip = "Show PROFIT/LOSS exit markers when price moves ±target % from entry. If a position " +
-               "is still open when Trading Hours ends without having reached ±target, it's force-closed " +
-               "instead — PROFIT if it's net positive, LOSS if net negative, using the actual % (not the " +
-               "target). Detected on the first bar after hours, but the label/alert are placed back at " +
-               "the real last bar — so no position (or its exit label) ever carries past your trading " +
-               "hours.")
+     tooltip = "Show PROFIT/LOSS exit markers when price moves ±target % from entry. A position still " +
+               "open when Trading Hours ends is left unresolved rather than force-closed — it carries " +
+               "over and is later scored a same-day-reversal (U) if the opposite signal never fires.")
 pnlTarget = input.float(1.0, "P&L Target (%)", minval = 0.1, maxval = 10.0, step = 0.1, group = grp_pnl,
      tooltip = "PROFIT/LOSS fires at ±this percent from entry. Default 1.0%.")
 
@@ -135,7 +132,7 @@ tradingHours = input.session("0930-1600:23456", "Trading Hours", group = grp_hou
                "at all, which is what let signals fire outside your actual trading hours. Uses the " +
                "chart's exchange timezone. Default 09:30–16:00, Mon–Fri (US market hours). Enter a " +
                "single continuous range — a comma-separated multi-range session (e.g. a lunch break) " +
-               "is treated as multiple separate trading days: an open position gets force-resolved at " +
+               "is treated as multiple separate trading days: the position flatten/reset fires at " +
                "each internal gap, not just at the actual end of day.")
 
 grp_vis = "📊 Dashboard & Visuals"
@@ -143,8 +140,8 @@ showDash = input.bool(true, "Show Dashboard", group = grp_vis,
      tooltip = "Bottom-right metrics table.")
 extDash  = input.bool(false, "Extended Metrics", group = grp_vis,
      tooltip = "Adds the per-component point breakdown plus the Net P&L (Σ), Volatility, ATR Fuel, " +
-               "Bars From Flip, Initial Balance, CVD Slope, and Gate Details rows. The BUY/SELL win-rate + " +
-               "Trade Signal rows show regardless of this setting.")
+               "Bars From Flip, Initial Balance, CVD Slope, and Gate Details rows. The BUY/SELL win-rate " +
+               "rows show regardless of this setting.")
 
 // (No index-proxy input — the ETF used to source VWAP/volume for a
 // volume-less cash index is auto-picked by symbol family in the INDEX DATA
@@ -410,22 +407,26 @@ string proxy_ticker = sym_is_ndx ? "NASDAQ:QQQ" : (sym_is_tsx ? "TSX:XIC" : "AME
 // index price units), proxy bar volume, proxy 20-bar volume SMA. lookahead
 // off — same non-repaint contract as the daily ATR request below.
 //
-// syminfo.type is `simple` (fixed for a given chart, the same class of
-// condition cvd_tf_ok uses to gate request.security_lower_tf below), so
-// gating this call itself behind it is safe and skips the call entirely —
-// not just its result — on the 4 non-MARKET-index profiles (stock / ETF /
-// futures / crypto), which are the large majority of charts and never read
-// proxy data (use_proxy is always false there, since proxy_eligible already
-// requires syminfo.type == "index"). Previously this ran unconditionally on
-// every bar, on every symbol, pointing at the chart's own symbol/timeframe
+// Both gate terms are `simple` (fixed for a given chart — `syminfo.type`, and
+// `proxy_family_known` via str.contains on `syminfo.ticker`), the same class
+// of condition cvd_tf_ok uses to gate request.security_lower_tf below, so
+// gating this call itself behind them is safe and skips the call entirely —
+// not just its result. That covers both cases where the result is guaranteed
+// unused: the 4 non-index profiles (stock / ETF / futures / crypto, the large
+// majority of charts — `proxy_eligible` already requires `syminfo.type ==
+// "index"`), and an index whose family the map doesn't recognize (DAX, FTSE,
+// Nikkei — `proxy_ticker` falls through to "AMEX:SPY" there, but `use_proxy`
+// additionally requires `proxy_family_known`, so the fetched SPY data could
+// never be read; those symbols take the session-TWAP path, which is driven by
+// `proxy_eligible`, not by this request). Previously this ran unconditionally
+// on every bar, on every symbol, pointing at the chart's own symbol/timeframe
 // for the non-index case to avoid a foreign feed — but that still paid the
-// full request.security context-switch cost for no reason, since the result
-// was already guaranteed unused there.
+// full request.security context-switch cost for no reason.
 float proxy_vwap_raw    = na
 float proxy_close_raw   = na
 float proxy_vol_raw     = na
 float proxy_vol_ma_raw  = na
-if syminfo.type == "index"
+if syminfo.type == "index" and proxy_family_known
     [pv_vwap, pv_close, pv_vol, pv_volma] = request.security(
          proxy_ticker, timeframe.period,
          [ta.vwap(close), close, volume, ta.sma(volume, len20)],
@@ -1349,9 +1350,9 @@ var bool has_previous_signal = false
 // "0930-1130,1300-1600:23456") — in_session correctly reports "inside any
 // sub-range" for such a string, but session_just_opened/session_just_closed
 // fire at EVERY sub-range boundary, not just the real start/end of the
-// trading day. That means the daily flatten/reset (below) and the day-end
-// forced P&L resolution (see DAY-END FORCED RESOLUTION) would trigger at each
-// internal gap too, prematurely force-scoring an open position at, e.g., the
+// trading day. That means the daily flatten/reset (below) and the
+// earnings-day IB-widening reset (keyed off session_just_closed) would
+// trigger at each internal gap too, prematurely resetting state at, e.g., the
 // lunch break rather than at the actual close. Not fixed here: distinguishing
 // "the last sub-range of today" from an internal gap isn't derivable from
 // in_session/prev_in_session alone (it would need to parse tradingHours
@@ -1365,16 +1366,11 @@ bool session_just_opened = in_session and not prev_in_session
 
 // Mirrors session_just_opened exactly (same proven in_session/prev_in_session
 // primitives, just inverted) — fires on the FIRST bar AFTER the trading-hours
-// session ends. Used to force-resolve any still-open position at day's end;
-// see DAY-END FORCED RESOLUTION below. (An earlier attempt tried to detect
-// the LAST in-session bar directly via time_close(timeframe.period,
-// tradingHours), reasoning that it would return na once a bar's close time
-// crosses the session boundary — it didn't behave that way in practice and
-// the condition never fired. Detecting the bar AFTER close, which reuses the
-// exact mechanism session_just_opened already relies on, is far more
-// reliable; the trade-off is that this fires one bar late; the day-end
-// close logic below anchors its label/alert back to the correct prior bar
-// using close[1]/bar_index[1] to compensate.)
+// session ends. Feeds the earnings-day IB-widening reset (see "Earnings-day
+// IB widening" in Key Design Decisions) — resetting there rather than on the
+// next session_just_opened matters specifically for an after-the-close (AMC)
+// earnings report on a chart with extended hours, where the report's one
+// non-na bar lands before the next RTH open fires.
 bool session_just_closed = not in_session and prev_in_session
 
 //======================================================================
@@ -1386,7 +1382,6 @@ var string pnl_direction = "NONE"       // "BUY" or "SELL" or "NONE"
 var bool pnl_exit_fired = false         // Has PROFIT/LOSS fired for this entry?
 var string pnl_exit_type = "NONE"       // Direction of the entry an exit closed
 var int pnl_entry_bar = na              // bar_index the current entry opened on
-var float day_end_frozen_pnl = na       // Live-P&L freeze value once day-end-resolved
 
 // Flatten at RTH session open. The win-rate tracker already closes any
 // carried-over entry at this boundary (see SIGNAL GENERATION), so leaving
@@ -1399,14 +1394,13 @@ if session_just_opened
     pnl_exit_fired := false
     pnl_exit_type := "NONE"
     pnl_entry_bar := na
-    day_end_frozen_pnl := na
 
-// One formula for net-of-friction P&L, reused by current_pnl and
-// day_end_pnl below — so a future change to the friction model (or a new
-// P&L-deriving site) can't silently update one copy and leave another
-// frictionless, the exact bug shape live_pnl_pct had before it was fixed to
-// reuse current_pnl instead of re-deriving its own raw formula (see "P&L
-// friction cost" in Key Design Decisions).
+// One formula for net-of-friction P&L, shared by the BUY/SELL branches of
+// current_pnl below — so a future change to the friction model can't
+// silently update one direction and leave the other frictionless, the exact
+// bug shape live_pnl_pct had before it was fixed to reuse current_pnl instead
+// of re-deriving its own raw formula (see "P&L friction cost" in Key Design
+// Decisions).
 net_pnl_pct(bool is_buy, float entry, float px) =>
     float raw_pct = is_buy ? (px - entry) / entry * 100 : (entry - px) / entry * 100
     raw_pct - PNL_FRICTION_PCT
@@ -1421,106 +1415,20 @@ if pnl_direction == "BUY" and not na(pnl_entry_price)
 else if pnl_direction == "SELL" and not na(pnl_entry_price)
     current_pnl := net_pnl_pct(false, pnl_entry_price, close)
 
-// Target/stop hit detection — normal, in-session path only.
+// Target/stop hit detection — in-session only. A position still open when the
+// session ends is left unresolved rather than force-closed; it either
+// reverses on an opposite signal (bucketed at that close) or carries over the
+// session boundary and is bucketed U at the session_just_opened carryover
+// reset (see SUCCESS RATE TRACKING).
 bool target_hit = current_pnl >= pnlTarget
 bool stop_hit = current_pnl <= -pnlTarget
-bool normal_target_reached = not pnl_exit_fired and barstate.isconfirmed and in_session and target_hit
-bool normal_stop_reached   = not pnl_exit_fired and barstate.isconfirmed and in_session and stop_hit
-
-//----------------------------------------------------------------------
-// DAY-END FORCED RESOLUTION
-//----------------------------------------------------------------------
-// If a position is still open and hasn't hit +/-pnlTarget by the time the
-// trading-hours session ends, force-close it using the sign of its P&L at
-// that point — instead of letting it drift through off-hours bars (which is
-// what used to let PROFIT/LOSS fire outside trading hours, since current_pnl
-// kept evaluating on every bar regardless of session) or carrying it
-// silently into the next session where it would be excluded as unresolved.
-//
-// Fallback trigger for a tradingHours window that covers every bar (e.g.
-// widened to "0000-2359:1234567" for a 24h symbol, per this script's own
-// guidance for removing hours restriction) — session_just_closed can never
-// fire there since in_session never goes false, so day-end forced resolution
-// would otherwise never engage and a stuck position could carry indefinitely,
-// contradicting the "every entry resolves same day" guarantee. Falls back to
-// the calendar-day rollover (is_new_session, the same detector already used
-// for the daily ATR fuel gauge / Time-of-Day RVOL) whenever in_session never
-// dipped false around it. Excludes any bar where the position already
-// resolved normally this same bar (target_hit/stop_hit), so the two paths
-// can never both claim the same exit.
-bool day_end_fallback = is_new_session and in_session and prev_in_session and not target_hit and not stop_hit
-
-// Third path — fire the resolution ON the last in-session bar itself, at the
-// LIVE EDGE only (barstate.islast). session_just_closed and day_end_fallback
-// both need a bar AFTER the close to fire on; on an RTH-only feed viewed live
-// right at the close there isn't one until the next session opens, so the
-// day-end bubble would not appear for hours. This instead detects "the current
-// (final) bar's wall-clock close has reached the tradingHours end time".
-// NOTE: this is NOT the time_close(timeframe, session) attempt that failed
-// before (see RTH SESSION WINDOW) — it reads the plain time_close bar-close
-// timestamp and compares it to the session-end minute parsed out of
-// tradingHours ("HHMM-HHMM:DDDDD", last range if comma-separated). Historical
-// days are untouched: barstate.islast is only ever the dataset's last bar, so
-// every earlier day still resolves via session_just_closed, and on reload this
-// same bar re-resolves via that path at the identical bar/price/%.
-var array<string> _th_dash_parts = str.split(tradingHours, "-")
-var string        _th_last_range = array.get(_th_dash_parts, array.size(_th_dash_parts) - 1)
-var string        _th_end_str    = array.get(str.split(_th_last_range, ":"), 0)
-var float         _th_end_hhmm   = str.tonumber(_th_end_str)
-var int session_end_mins = not na(_th_end_hhmm) ? int(_th_end_hhmm / 100) * 60 + int(_th_end_hhmm) % 100 : na
-int  bar_close_mins      = hour(time_close, syminfo.timezone) * 60 + minute(time_close, syminfo.timezone)
-bool reached_session_end = not na(session_end_mins) and bar_close_mins >= session_end_mins
-bool day_end_onbar   = barstate.islast and barstate.isconfirmed and in_session and reached_session_end
-
-bool day_end_trigger  = session_just_closed or day_end_fallback or day_end_onbar
-
-// Evaluated on day_end_trigger. The two one-bar-late paths (first OFF-hours
-// bar, or the calendar-rollover fallback bar) read close[1] — the actual last
-// bar of the period that just ended — and the draw site anchors the label back
-// to bar_index[1]/close[1]. The onbar path already runs on that final bar, so
-// it reads close and anchors there. Gated on day_end_trigger since it's
-// otherwise read only on that one bar per day.
-// Same net_pnl_pct() helper as current_pnl above — a day-end position that
-// closes exactly flat before cost now correctly resolves as a small loss
-// (day_end_win_hit reads the sign of this value below), matching what a real
-// round-trip would show.
-float day_end_pnl = 0.0
-if day_end_trigger
-    float de_px = day_end_onbar ? close : close[1]
-    if pnl_direction == "BUY" and not na(pnl_entry_price)
-        day_end_pnl := net_pnl_pct(true, pnl_entry_price, de_px)
-    else if pnl_direction == "SELL" and not na(pnl_entry_price)
-        day_end_pnl := net_pnl_pct(false, pnl_entry_price, de_px)
-
-// Requires the entry to have opened before the bar the trigger is resolving —
-// otherwise close/close[1] IS the entry price and day_end_pnl is a trivial,
-// meaningless exact-zero. Such an entry never had real market exposure, so it's
-// left unresolved (excluded from win/loss, same as any other same-day reversal
-// that never hit target or stop) rather than force-scored as a zero-P&L win.
-// The onbar path resolves on bar_index, so its cutoff is one bar tighter than
-// the one-bar-late paths' bar_index - 1.
-bool day_end_entry_ok = day_end_onbar ? (pnl_entry_bar < bar_index) : (pnl_entry_bar < bar_index - 1)
-bool day_end_close    = day_end_trigger and pnl_direction != "NONE" and not pnl_exit_fired and
-     barstate.isconfirmed and not na(pnl_entry_bar) and day_end_entry_ok
-bool day_end_win_hit  = day_end_close and day_end_pnl >= 0
-bool day_end_loss_hit = day_end_close and day_end_pnl < 0
-
-// Freezes the dashboard's live P&L display at this final value once
-// day-end-resolved — otherwise it kept recomputing off the current (possibly
-// drifting, off-hours) close even after the outcome was already permanently
-// scored from close[1], visually contradicting the recorded result. A normal
-// in-session target/stop hit deliberately keeps updating live (see LIVE P&L
-// TRACKING below) — this freeze applies to the day-end path only.
-if day_end_close
-    day_end_frozen_pnl := day_end_pnl
-
 // Target/stop resolution is tracked INTERNALLY regardless of enablePnL, only
 // once per entry (not pnl_exit_fired). Win-rate tracking reads these — if
 // they were gated on enablePnL, turning off "Enable P&L Exit Signals" (a
 // display toggle) would silently make every tracked signal score as a loss
 // and pin both win rates at 0%.
-bool target_reached = normal_target_reached or day_end_win_hit
-bool stop_reached   = normal_stop_reached or day_end_loss_hit
+bool target_reached = not pnl_exit_fired and barstate.isconfirmed and in_session and target_hit
+bool stop_reached   = not pnl_exit_fired and barstate.isconfirmed and in_session and stop_hit
 
 // Visible PROFIT/LOSS exit signals (labels + alerts) — display-gated.
 bool signal_profit = target_reached and enablePnL
@@ -1540,9 +1448,9 @@ if target_reached or stop_reached
 // RTH session-open carryover), is bucketed into exactly one of:
 //   W  — PROFIT (target_reached) fired while it was open
 //   L  — LOSS   (stop_reached)   fired while it was open
-//   U  — neither: reversed on the same trading day before hitting
-//        +/-pnlTarget. Since day-end forced resolution that's the ONLY way
-//        to stay unresolved. Not "excluded" any more — U is its own bucket.
+//   U  — neither: reversed before hitting +/-pnlTarget, or still open when
+//        the session ended and carried over unresolved at the next
+//        session_just_opened. Not "excluded" — U is its own bucket.
 // Each bucket is a var array<int> of the session_seq at CLOSE time, trimmed
 // to the trailing WINRATE_LOOKBACK_SESSIONS every bar. Dashboard shows
 // W/L/U directly; win rate = W/(W+L); the Trade Signal verdict's "fired" is
@@ -2091,12 +1999,11 @@ if enableSuccessRate
         sell_lost_this_entry := true
 
     // Σ: capture the net % the exit resolved at — the same value the
-    // PROFIT/LOSS label shows (day_end_pnl on the day-end path, else
-    // current_pnl, both already net of PNL_FRICTION_PCT).
+    // PROFIT/LOSS label shows (current_pnl, already net of PNL_FRICTION_PCT).
     if (target_reached or stop_reached) and pnl_direction == "BUY"
-        buy_entry_result := day_end_close ? day_end_pnl : current_pnl
+        buy_entry_result := current_pnl
     if (target_reached or stop_reached) and pnl_direction == "SELL"
-        sell_entry_result := day_end_close ? day_end_pnl : current_pnl
+        sell_entry_result := current_pnl
 
     // The opposite signal closes the prior entry — bucket it now (W/L into
     // the overall window AND the per-module store keyed by the opening
@@ -2169,12 +2076,12 @@ if signal_sell
     last_signal_type := "SELL"
     has_previous_signal := true
 
-// Dashboard "Trade Signal" verdict (tracks only the direction that fired
-// LAST, last_signal_type) is computed lazily down in DASHBOARD
-// (barstate.islast, enableSuccessRate only) — trade_verdict() runs
-// wilson_lower_bound() plus several str.tostring calls, and its only
-// consumer is that one dashboard row, so it's kept off the per-bar path the
-// same way the component status-string details are.
+// Trade Signal verdict (tracks only the direction that fired LAST,
+// last_signal_type) is computed lazily down in DASHBOARD (barstate.islast,
+// enableSuccessRate only) — trade_verdict() runs wilson_lower_bound() plus
+// several str.tostring calls, and its only consumer is the header title, so
+// it's kept off the per-bar path the same way the component status-string
+// details are.
 
 //======================================================================
 // UPDATE P&L EXIT TRACKING
@@ -2195,14 +2102,12 @@ if signal_buy
     pnl_direction := "BUY"
     pnl_exit_fired := false
     pnl_entry_bar := bar_index
-    day_end_frozen_pnl := na
 
 if signal_sell
     pnl_entry_price := close
     pnl_direction := "SELL"
     pnl_exit_fired := false
     pnl_entry_bar := bar_index
-    day_end_frozen_pnl := na
 
 // LIVE P&L TRACKING (DASHBOARD DISPLAY): live_pnl_pct/pnl_text — the only
 // consumer is the dashboard header — are computed lazily down in DASHBOARD
@@ -2317,25 +2222,6 @@ if signal_sell and showLabels
 //======================================================================
 // PROFIT/LOSS EXIT LABELS WITH ANCHOR-AWARE POSITIONING
 //======================================================================
-// Shared by both blocks below. normal_target_reached/normal_stop_reached and
-// day_end_win_hit/day_end_loss_hit are mutually exclusive by construction
-// (see DAY-END FORCED RESOLUTION), so checking day_end_win_hit/loss_hit
-// directly tells us which path resolved this bar — correct whether the
-// day-end path fired via the off-hours session_just_closed bar or the
-// same-bar calendar-rollover fallback (where in_session stays true
-// throughout, so "not in_session" would misidentify the path).
-//
-// Day-end: anchor the label back to the real last-bar-of-the-period
-// (bar_index - 1 / close[1]), since the code itself runs one bar late.
-// Normal: anchored to this bar as usual.
-day_end_label_anchor(bool is_day_end) =>
-    // The one-bar-late day-end paths anchor back to bar_index-1/close[1]; the
-    // onbar path already IS the final bar, so it anchors here at close.
-    bool late = is_day_end and not day_end_onbar
-    int   lb = late ? bar_index - 1 : bar_index
-    float lp = late ? close[1] : (is_day_end ? close : anchor_line_price)
-    [lb, lp]
-
 // A live signal_buy/signal_sell reversing the position takes precedence
 // (label points opposite the new direction); otherwise fall back to which
 // side pnl_exit_type says was closed — where PROFIT and LOSS point opposite
@@ -2354,12 +2240,10 @@ exit_label_style(bool is_profit) =>
     style
 
 if signal_profit and enablePnL
-    bool  is_day_end   = day_end_win_hit
-    string label_text  = is_day_end ? "PROFIT " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "PROFIT +" + str.tostring(pnlTarget, "#.#") + "%"
-    [label_bar, label_price] = day_end_label_anchor(is_day_end)
+    string label_text  = "PROFIT +" + str.tostring(pnlTarget, "#.#") + "%"
     string label_style = exit_label_style(true)
 
-    label.new(label_bar, label_price, label_text,
+    label.new(bar_index, anchor_line_price, label_text,
          yloc = yloc.price,
          style = label_style,
          color = color.new(color.blue, 0),
@@ -2367,12 +2251,10 @@ if signal_profit and enablePnL
          size = size.normal)
 
 if signal_loss and enablePnL
-    bool  is_day_end   = day_end_loss_hit
-    string label_text  = is_day_end ? "LOSS " + str.tostring(day_end_pnl, "+#.##;-#.##") + "%" : "LOSS -" + str.tostring(pnlTarget, "#.#") + "%"
-    [label_bar, label_price] = day_end_label_anchor(is_day_end)
+    string label_text  = "LOSS -" + str.tostring(pnlTarget, "#.#") + "%"
     string label_style = exit_label_style(false)
 
-    label.new(label_bar, label_price, label_text,
+    label.new(bar_index, anchor_line_price, label_text,
          yloc = yloc.price,
          style = label_style,
          color = color.new(color.blue, 0),
@@ -2409,11 +2291,10 @@ if showDash and barstate.islast
     if gate5_divergence
         active_gate_count += 1
 
-    // Trade Signal verdict — computed here (rather than down by its own row)
-    // so the header can show it too. See "Trade Signal verdict" in Key
-    // Design Decisions for the WAIT/SKIP(CHOPPY)/TRADE/CAUTION/SKIP logic;
-    // verdict_text/verdict_color are reused unchanged by the dedicated
-    // Trade Signal row further down.
+    // Trade Signal verdict — computed here for the header title only (no
+    // dedicated dashboard row anymore, dropped at user request). See "Trade
+    // Signal verdict" in Key Design Decisions for the WAIT/SKIP(CHOPPY)/
+    // TRADE/CAUTION/SKIP logic.
     string verdict_text  = ""
     color  verdict_color = color.gray
     if enableSuccessRate
@@ -2435,24 +2316,27 @@ if showDash and barstate.islast
     // Live P&L header figure — reuses current_pnl (P&L EXIT TRACKING above)
     // rather than re-deriving the price move here, so the header always
     // matches exit-signal math exactly — PNL_FRICTION_PCT included, since
-    // current_pnl is already net of it. Once day-end-resolved
-    // (day_end_frozen_pnl set), the frozen value wins regardless of
-    // in_session — the entry's outcome is already permanently scored, so the
-    // display must stop drifting with the live/off-hours close. Computed
-    // here (last bar only) rather than per-bar since the header is its only
-    // consumer.
-    float live_pnl_pct = not na(day_end_frozen_pnl) ? day_end_frozen_pnl :
-         pnl_direction != "NONE" and not na(pnl_entry_price) ? current_pnl : 0.0
+    // current_pnl is already net of it. Keeps drifting with the close on any
+    // still-open position (including off-hours) until the next
+    // session_just_opened flattens it. Computed here (last bar only) rather
+    // than per-bar since the header is its only consumer.
+    float live_pnl_pct = pnl_direction != "NONE" and not na(pnl_entry_price) ? current_pnl : 0.0
     string pnl_text = pnl_direction != "NONE" ?
          str.format("{0,number,+#.##;-#.##}%", live_pnl_pct) : "—"
 
-    // Header — no trailing padding: the merged header cell's width already
-    // comes from the widest content in the rows below it, and padding text
-    // before centering just pushes the visible text left of true-center.
+    // Header — no trailing padding: the merged header cell's width comes from
+    // whichever content is widest (usually a row below, but a long verdict
+    // like "· SELL SKIP (CHOPPY)" can make it the header itself), and padding
+    // text before centering just pushes the visible text left of true-center.
     // Background stays the original plain gray regardless of verdict — only
     // the verdict word itself was added to the title text; a verdict-tinted
     // background wash was tried and reverted at user request.
-    string header_verdict  = has_previous_signal ? " · " + last_signal_type + " " + verdict_text : ""
+    // Gated on enableSuccessRate as well as has_previous_signal: without it,
+    // turning enableSuccessRate off (a retunable FIXED BEHAVIOUR flag) leaves
+    // verdict_text empty and the header renders a dangling "· BUY  |" with no
+    // verdict.
+    string header_verdict  = enableSuccessRate and has_previous_signal ?
+         " · " + last_signal_type + " " + verdict_text : ""
     string header_with_pnl = "SLT " + VERSION + header_verdict + " | PnL " + pnl_text
 
     table.cell(d, 0, 0, header_with_pnl,
@@ -2515,25 +2399,10 @@ if showDash and barstate.islast
     table.cell(d, 1, row, dashboard_quality + " (" + str.tostring(dashboard_score) + ")", text_color = color.white, text_size = size.small)
     row += 1
 
-    // Trade Signal — verdict for whichever direction fired LAST
-    // (last_signal_type). "—" until any signal has fired at all. Gated on
-    // enableSuccessRate since the verdict is built from the same resolved
-    // win-rate stats (totalWins_*/totalTrades_*) as the BUY/SELL Win Rate
-    // rows below. verdict_text/verdict_color were already computed once,
-    // above, so the header can show the same verdict too — reused here
-    // rather than calling trade_verdict() a second time.
-    if enableSuccessRate
-        string trade_signal_display = has_previous_signal ? last_signal_type + " · " + verdict_text : "—"
-        color  trade_signal_color   = has_previous_signal ? verdict_color : color.gray
-
-        table.cell(d, 0, row, "Trade Signal",
-             text_color = color.white,
-             text_halign = text.align_left,
-             text_size = size.small)
-        table.cell(d, 1, row, trade_signal_display,
-             text_color = trade_signal_color,
-             text_size = size.small)
-        row += 1
+    // Trade Signal verdict — no longer a dedicated row (dropped at user
+    // request; the header title already carries the same verdict word, see
+    // "SLT <VERSION> · <dir> <verdict> | PnL <x%>" above). verdict_text/
+    // verdict_color are still computed once above for the header's sake.
 
     // Gates Display
     string gate_label = gateOn ? "Gates" : "Risks"

@@ -104,27 +104,29 @@ Sequential sections — order matters in Pine Script:
 10. **P&L tracking** — two independent systems: (a) live dashboard P&L
     (`pnl_entry_price`/`pnl_direction`, reset on each new signal, flattened at
     session open); (b) signal-to-signal `signal_pnl` history on labels. Exits:
-    `target_hit`/`stop_hit` when `current_pnl` crosses `±pnlTarget` (`in_session`-
-    gated), or a **day-end forced resolution** by the sign of P&L if still open
-    when the session ends. `enablePnL` gates only the visible `signal_profit`/
-    `signal_loss` — never resolution.
+    `target_hit`/`stop_hit` when `current_pnl` crosses `±pnlTarget`
+    (`in_session`-gated) — the only resolution path; a position still open
+    when the session ends is left unresolved and carries over (see item 11).
+    `enablePnL` gates only the visible `signal_profit`/`signal_loss` — never
+    resolution.
 11. **Success rate tracking** — every closed BUY/SELL trade lands in one of three
     per-direction `var array<int>` (W = `target_reached`, L = `stop_reached`,
     U = same-day reversal with neither). Front-trimmed every bar to the trailing
     `WINRATE_LOOKBACK_SESSIONS` (20) trading sessions. The numbers compose:
     win rate = `W/(W+L)`, resolved = `W+L`, fired = `W+L+U`. The **Trade Signal**
-    verdict row turns the last-fired direction's stats into TRADE/CAUTION/SKIP/
-    WAIT. Per-module store (`mod_results`) still runs but its rows are suppressed
-    (`multi_module = orbEnabled` = false).
+    verdict turns the last-fired direction's stats into TRADE/CAUTION/SKIP/WAIT
+    — shown in the dashboard header title only, no dedicated row. Per-module
+    store (`mod_results`) still runs but its rows are suppressed (`multi_module
+    = orbEnabled` = false).
 12. **Visuals** — one branch per anchor: EMA9 dynamic line, or SMA line + grey
     ATR buffer band; flip circles; BUY/SELL labels at `anchor_line_price`. ORB
     high/low plot gated off. VWAP fade plots deleted.
 13. **Dashboard** — `table.new` bottom-right, `DASHBOARD_MAX_ROWS = 36`, rendered
     on `barstate.islast`, `table.clear`ed each render. Header reads `SLT
     <VERSION> · <BUY/SELL> <verdict> | PnL <x%>` once any signal has fired
-    (just `SLT <VERSION> | PnL —` before that) — `<verdict>` is the same
-    Trade Signal verdict word shown in its own row below (see [Trade Signal
-    verdict](#key-design-decisions)). Background stays the plain gray it
+    (just `SLT <VERSION> | PnL —` before that) — `<verdict>` is the Trade
+    Signal verdict word (see [Trade Signal verdict](#key-design-decisions)),
+    shown only in the title now, not as its own row. Background stays the plain gray it
     always was (a verdict-tinted background was tried and reverted — the
     verdict is only in the title text, not the cell color). First data row = active anchor + price.
     Signal Anchor row shows resolved auto values (e.g.
@@ -533,57 +535,42 @@ reset on every new signal (strict alternation means entry always = the signal
 that opened the position). *Signal P&L History* on labels, `%` from
 `last_signal_price` using the previous signal's direction — separate state.
 
-**P&L friction cost:** `current_pnl` and `day_end_pnl` both compute via one
-shared `net_pnl_pct(is_buy, entry, px)` function — `raw_pct - PNL_FRICTION_PCT`
-where `raw_pct` is the directional `(px - entry)/entry × 100` (or the mirror
-for a sell) — rather than each inlining its own copy of the formula (a
-`/code-review` pass flagged the original two-inline-copies version as the same
-duplication-risk shape as the `live_pnl_pct` bug below, before either had
-shipped). `PNL_FRICTION_PCT` (0.05, a single conservative generic estimate —
-not profile-scaled) covers the round-trip bid-ask spread + slippage a live
-fill would actually pay. Applied at the source so every consumer — `target_hit`/`stop_hit`,
-`day_end_win_hit`/`day_end_loss_hit`, the win-rate W/L/U buckets they feed, and
-every P&L *display* (dashboard header `PnL <x>%`, day-end PROFIT/LOSS label
-text) — reflects a realistic net outcome without being touched individually.
-Net effect: a raw move now needs `pnlTarget + PNL_FRICTION_PCT` to trigger
-PROFIT (stop triggers `PNL_FRICTION_PCT` sooner), and a position that closes
-exactly flat at day's end correctly resolves as a small loss rather than a
-trivial win. Deliberately scoped to this system only — the separate *Signal
-P&L History* (`signal_pnl`, shown on labels) is purely informational, not used
-for target/stop or win-rate resolution, and is left as a raw price move.
-Fixed a pre-existing duplicate along the way: the dashboard header's
-`live_pnl_pct` re-derived the same raw formula independently instead of
-reusing `current_pnl`, which would have bypassed the friction subtraction
-silently — now reuses `current_pnl` directly (the day-end-frozen branch was
-already correct, since `day_end_frozen_pnl := day_end_pnl`). No panel input —
-retune `PNL_FRICTION_PCT` in `FIXED BEHAVIOUR`.
+**P&L friction cost:** `current_pnl` computes via `net_pnl_pct(is_buy, entry,
+px)` — `raw_pct - PNL_FRICTION_PCT` where `raw_pct` is the directional
+`(px - entry)/entry × 100` (or the mirror for a sell) — rather than inlining
+the formula separately for the BUY/SELL branches. `PNL_FRICTION_PCT` (0.05, a
+single conservative generic estimate — not profile-scaled) covers the
+round-trip bid-ask spread + slippage a live fill would actually pay. Applied
+at the source so every consumer — `target_reached`/`stop_reached`, the
+win-rate W/L/U buckets they feed, and every P&L *display* (dashboard header
+`PnL <x>%`, PROFIT/LOSS label text) — reflects a realistic net outcome without
+being touched individually. Net effect: a raw move now needs `pnlTarget +
+PNL_FRICTION_PCT` to trigger PROFIT (stop triggers `PNL_FRICTION_PCT` sooner).
+Deliberately scoped to this system only — the separate *Signal P&L History*
+(`signal_pnl`, shown on labels) is purely informational, not used for
+target/stop or win-rate resolution, and is left as a raw price move. Fixed a
+pre-existing duplicate along the way: the dashboard header's `live_pnl_pct`
+re-derived the same raw formula independently instead of reusing
+`current_pnl`, which would have bypassed the friction subtraction silently —
+now reuses `current_pnl` directly. No panel input — retune `PNL_FRICTION_PCT`
+in `FIXED BEHAVIOUR`.
 
-**P&L exits fire on target/stop, or are forced at day's end:**
-`normal_target_reached`/`normal_stop_reached` fire when `current_pnl` crosses
-`±pnlTarget`, once per entry, `in_session`-gated. `target_reached =
-normal_target_reached or day_end_win_hit` (mirror for stop), so all downstream
-consumers are covered by two booleans. `day_end_trigger = session_just_closed or
-day_end_fallback or day_end_onbar`, three paths: `session_just_closed = not
-in_session and prev_in_session` (first off-hours bar, one bar late) is the normal
-path; `day_end_fallback` keys off the calendar-day rollover (`is_new_session`)
-for a 24h-widened `tradingHours` where `in_session` never goes false;
-`day_end_onbar` fires **on the final in-session bar itself, at the live edge
-only** (`barstate.islast and barstate.isconfirmed and in_session and
-bar_close_mins >= session_end_mins`, where `session_end_mins` is parsed once from
-`tradingHours`) — without it, an RTH-only feed viewed live at the close has no
-later bar and the bubble waits hours for the next session. Historical days are
-untouched (`barstate.islast` is only the dataset's last bar); on reload the same
-bar re-resolves via `session_just_closed` at the identical bar/price. At the
-trigger, if still unresolved (`pnl_direction != "NONE"`, `not pnl_exit_fired`,
-and the entry opened before the resolving bar — `< bar_index` for `day_end_onbar`,
-`< bar_index - 1` for the two late paths — else a meaningless 0% win), it
-resolves by the sign of `day_end_pnl` (`day_end_onbar` reads `close`, the late
-paths `close[1]`). Label/alert anchored to that same bar (`bar_index`/`close`
-onbar, `bar_index - 1`/`close[1]` late); dashboard live P&L freezes at
-`day_end_frozen_pnl`.
-`enablePnL` gates only `signal_profit`/`signal_loss` (labels + alerts), never
-resolution or win-rate scoring — keep any future stats logic on
-`target_reached`/`stop_reached`.
+**P&L exits fire on target/stop only — no day-end forced resolution:**
+`target_reached`/`stop_reached` fire when `current_pnl` crosses `±pnlTarget`,
+once per entry (`not pnl_exit_fired`), `in_session`-gated. A position still
+open when the session ends is left alone — no forced close, no synthetic
+label. It keeps drifting with the close (dashboard header `PnL <x>%`
+included) until either the opposite signal fires (closing it normally) or the
+next `session_just_opened` flattens the tracked position and the win-rate
+carryover reset (see below) buckets it U, since neither `target_reached` nor
+`stop_reached` ever fired for it. `enablePnL` gates only `signal_profit`/
+`signal_loss` (labels + alerts), never resolution or win-rate scoring — keep
+any future stats logic on `target_reached`/`stop_reached`. (An earlier
+version force-closed a still-open position at day's end by the sign of its
+P&L at that moment — `day_end_trigger`/`day_end_pnl`/`day_end_win_hit`/
+`day_end_loss_hit`/`day_end_frozen_pnl` and three trigger paths keyed off
+`session_just_closed`/`is_new_session`/a parsed `session_end_mins`. Removed at
+user request; see HISTORY.md for the mechanics if ever revisited.)
 
 **Position flattened at session open:** on `session_just_opened`,
 `pnl_entry_price`/`pnl_direction`/`pnl_exit_fired`/`pnl_exit_type` reset — this is
@@ -594,8 +581,9 @@ Applies to every asset type.
 **when it closes** (next opposite signal, or `session_just_opened` carryover),
 lands in exactly one of `buy_win_s`/`buy_loss_s`/`buy_unr_s` (SELL trio too),
 each a `var array<int>` holding the `session_seq` at close time. W = PROFIT fired
-while open; L = LOSS fired; U = neither (same-day reversal before `±pnlTarget` —
-the only way to stay unresolved since day-end forced resolution).
+while open; L = LOSS fired; U = neither — reversed before `±pnlTarget`, or
+still open at `session_just_opened` (no day-end forced resolution; see "P&L
+exits fire on target/stop only" above).
 `buy_won_this_entry`/`buy_lost_this_entry` accumulate during the open trade;
 `buy_entry_open` guards against scoring before a trade opens; all flags cleared
 at both close paths. **Every bar** the six arrays are front-trimmed (no scan —
@@ -611,8 +599,8 @@ direction also keeps a paired `buy_all_s` (`array<int>` session stamp) /
 `buy_all_p` (`array<float>` net %) list, pushed at the same two close sites
 as the W/L/U buckets and trimmed in step by `trim_pair()`. The value pushed:
 for W/L, `buy_entry_result` — captured the bar `target_reached`/`stop_reached`
-fired as `day_end_close ? day_end_pnl : current_pnl` (the exact figure the
-PROFIT/LOSS label shows, net of `PNL_FRICTION_PCT`); for U at an
+fired as `current_pnl` (the exact figure the PROFIT/LOSS label shows, net of
+`PNL_FRICTION_PCT`); for U at an
 opposite-signal close, `current_pnl` on that bar (the net move to the
 reversal, while `pnl_direction` still holds the closing trade); for the
 session-open carryover, `nz(result, 0)` (no exposure). `sum_pnl()` sums the
@@ -624,14 +612,17 @@ no closed trades yet. Σ is per-trade %, equal size, no compounding — a
 setup-comparison figure, not an account return. The Trade Signal verdict is
 unchanged (still rate-based).
 
-**Trade Signal verdict:** a dashboard row right after Setup Score (deliberately
-*not* grouped with the Win Rate rows), turning the last-fired direction's
-(`last_signal_type`) resolved stats into a plain call — a bare word, no
-appended number. Computed by `trade_verdict(wins, total, fired)` inside the
-dashboard's `barstate.islast` block (moved there in a compile-perf pass — see
-"Pine Script v6 Gotchas"/HISTORY.md — since that's its only consumer; reads
-`last_signal_type` and the win-rate arrays as they stand on the last bar,
-same result as computing it per-bar would have given). Three gates in order:
+**Trade Signal verdict:** turns the last-fired direction's (`last_signal_type`)
+resolved stats into a plain call — a bare word, no appended number. Shown only
+in the dashboard **header title** (`SLT <VERSION> · <dir> <verdict> | PnL
+<x%>`, see Architecture item 13/Dashboard) — the dedicated "Trade Signal" row
+that used to sit right after Setup Score was dropped at user request; the
+header already carried the same word. Computed by `trade_verdict(wins, total,
+fired)` inside the dashboard's `barstate.islast` block (moved there in a
+compile-perf pass — see "Pine Script v6 Gotchas"/HISTORY.md — since that's its
+only consumer; reads `last_signal_type` and the win-rate arrays as they stand
+on the last bar, same result as computing it per-bar would have given). Three
+gates in order:
 1. **Sample size** — `< VERDICT_MIN_SAMPLE` (10) resolved → `WAIT (n/10)`.
 2. **Resolution rate** — `(W+L)/(W+L+U) < VERDICT_MIN_RESOLUTION` (0.40) →
    `SKIP (CHOPPY)`.
@@ -639,15 +630,12 @@ same result as computing it per-bar would have given). Three gates in order:
    `WILSON_Z = 1.96`) shrinks toward 50% at small `total`, judged against the
    same 60/50 tier cutoffs as the win-rate row colors: ≥60% `TRADE`, ≥50%
    `CAUTION`, below `SKIP`.
-All three thresholds are pinned constants. Row reads `—` until a signal has
-fired. (A per-trade expectancy figure, `target × (2·wlb − 1)`, used to be
-appended to the TRADE/CAUTION/SKIP tiers — dropped at user request as
+All three thresholds are pinned constants. Title omits the verdict until a
+signal has fired. (A per-trade expectancy figure, `target × (2·wlb − 1)`, used
+to be appended to the TRADE/CAUTION/SKIP tiers — dropped at user request as
 confusing/unhelpful; `trade_verdict()` no longer takes a `target` parameter.)
-The `trade_verdict()` call itself now happens once, up near `active_gate_count`
-(before `table.new`), rather than down by its own row — `verdict_text`/
-`verdict_color` are computed there and reused unchanged both by the header
-(see Architecture item 13/Dashboard) and by this row, so the same verdict
-never needs computing twice on a render.
+`verdict_text`/`verdict_color` are computed once, up near `active_gate_count`
+(before `table.new`), and consumed only by the header.
 
 **Per-module win-rate (Phase 4):** every W/L close also calls `record_module(...)`
 keyed by the module that **opened** the entry (U not tracked per-module).
@@ -679,16 +667,21 @@ first nonzero bar), borrow VWAP + RVOL from a liquid tracking ETF.
   Only these set `proxy_family_known` — an unrecognized index (DAX, FTSE, Nikkei)
   falls to the session-TWAP substitute, **not** SPY.
 - **One `request.security`** pulls `[ta.vwap, close, volume, ta.sma(volume,
-  len20)]` with `lookahead_off`, called only `if syminfo.type == "index"` —
-  `syminfo.type` is `simple` (fixed per chart, the same class of condition
-  `cvd_tf_ok` uses to gate `request.security_lower_tf`), so this skips the
-  call entirely — not just its result — on the 4 non-index profiles, which
-  never read proxy data anyway (`proxy_eligible` already requires
-  `syminfo.type == "index"`). A compile-perf pass found the call previously
+  len20)]` with `lookahead_off`, called only `if syminfo.type == "index" and
+  proxy_family_known` — both terms are `simple` (fixed per chart;
+  `proxy_family_known` via `str.contains` on `syminfo.ticker`), the same class
+  of condition `cvd_tf_ok` uses to gate `request.security_lower_tf`, so this
+  skips the call entirely — not just its result — in both cases where the
+  data could never be read: the 4 non-index profiles (`proxy_eligible`
+  requires `syminfo.type == "index"`), and an unrecognized index, where
+  `proxy_ticker` falls through to `AMEX:SPY` but `use_proxy` requires
+  `proxy_family_known` anyway. A compile-perf pass found the call previously
   ran unconditionally on every symbol, pointing at the chart's own
   symbol/timeframe for the non-index case "to avoid a foreign feed" — but
   that still paid the full `request.security` context-switch cost for a
-  result guaranteed unused there. `use_proxy = proxy_eligible and proxy_ok`.
+  result guaranteed unused there; a follow-up `/code-review` caught that the
+  first version of the gate still fetched SPY for DAX/FTSE/Nikkei.
+  `use_proxy = proxy_eligible and proxy_family_known and proxy_ok`.
 - **VWAP:** `proxy_vwap_scaled = close * (proxy_vwap / proxy_close)` — proxy's
   fractional deviation at index scale, so C2's math is unchanged. `vwap`
   reassigned once before C2: chart-volume → real `ta.vwap`; volume-less index +
@@ -785,17 +778,14 @@ No test runner. After any edit, verify in the Pine Editor:
     (static, unaffected by friction); the underlying trigger now needs a raw
     price move of `pnlTarget + PNL_FRICTION_PCT` (PROFIT) or
     `-pnlTarget - PNL_FRICTION_PCT`-or-less (LOSS, reached sooner in raw
-    terms) since `current_pnl` is net of friction. A position still open at
-    the last in-session bar fires `PROFIT/LOSS +<actual%>` with real,
-    friction-adjusted P&L; no PROFIT/LOSS label ever appears outside
-    `tradingHours`.
+    terms) since `current_pnl` is net of friction. No PROFIT/LOSS label ever
+    appears outside `tradingHours`; a position still open at the session
+    close never gets one either — see item 18.
 11b. **P&L friction cost:** the dashboard header's `PnL <x>%` and every
-    PROFIT/LOSS/day-end value are `PNL_FRICTION_PCT` (0.05) lower than the raw
-    price move would give — e.g. a position that closes at the literal entry
-    price at day's end resolves as a small LOSS, not a breakeven/win. The
-    separate Signal P&L History shown on BUY/SELL labels is untouched (still a
-    raw price move) — friction applies only to the live-tracking system that
-    feeds target/stop and win-rate resolution.
+    PROFIT/LOSS value are `PNL_FRICTION_PCT` (0.05) lower than the raw price
+    move would give. The separate Signal P&L History shown on BUY/SELL labels
+    is untouched (still a raw price move) — friction applies only to the
+    live-tracking system that feeds target/stop and win-rate resolution.
 12. **Entry freshness:** EMA Cross → no signal >10 bars after a flip; SMA →
     "Bars From Flip" reads `(unlimited)`.
 12b. **Initial Balance rejection:** the first confirmed close beyond the
@@ -840,25 +830,23 @@ No test runner. After any edit, verify in the Pine Editor:
 17. **Trading Hours on 24h symbols:** CRYPTO/FUTURES at default `tradingHours` →
     no signals outside 09:30–16:00, position flattens at each session open.
     Widen to `0000-2359:1234567` → signals resume around the clock.
-18. **Day-end resolution:** a position short of `±pnlTarget` at the close →
-    `PROFIT/LOSS +<actual%>` anchored at the actual last in-session bar, counted
-    into the win rate, no further label on later off-hours bars; live P&L freezes
-    at the day-end value. On an RTH-only feed watched live at the close the
-    bubble appears **on that last bar** the moment it confirms (`day_end_onbar`),
-    not only once a later bar prints; scroll back / reload → the label stays on
-    the same bar (now via `session_just_closed`).
-19. **Day-end fallback:** with `tradingHours` widened to 24h, a position that
-    never hits target still force-resolves at the calendar-day rollover; a signal
-    opening on that exact bar shows `U`, not a false `W`.
-20. **Profile auto-tune:** STOCK → `±0.25A` + `9/20`; MARKET INDEX → `±0.20A` +
+18. **No day-end forced resolution:** hold a position short of `±pnlTarget`
+    through the session close on an RTH feed → no PROFIT/LOSS label fires,
+    live P&L keeps drifting with the close through the off-hours bars, and
+    the trade is NOT yet counted into the win rate. At the next
+    `session_just_opened` it's flattened and lands in the U bucket (not a
+    false `W`/`L`). This applies identically whether `tradingHours` is a
+    normal RTH window or widened to 24h (`"0000-2359:1234567"`) — there is no
+    calendar-day-rollover fallback path either.
+19. **Profile auto-tune:** STOCK → `±0.25A` + `9/20`; MARKET INDEX → `±0.20A` +
     `9/30`; CRYPTO → `±0.35A` + `9/20`. Min-score base 45↔55 by profile.
-21. **ORB inert:** no ORB row, no orange lines, no `⚡ORB` label;
+20. **ORB inert:** no ORB row, no orange lines, no `⚡ORB` label;
     `active_strategy` always `Trend Pullback`.
-22. **Timeframe scaling:** 2-min unchanged (`9/20`, `70`); 5-min → periods drop
+21. **Timeframe scaling:** 2-min unchanged (`9/20`, `70`); 5-min → periods drop
     proportionally; Range/Tick → no error, lengths hold at 2-min values.
-23. **C1 direction follows the anchor** and always scores against `ema20`; its
+22. **C1 direction follows the anchor** and always scores against `ema20`; its
     status never contradicts the Trend row.
-23b. **VWAP Standard Deviation Bands:** on a volume-bearing symbol (NVDA,
+22b. **VWAP Standard Deviation Bands:** on a volume-bearing symbol (NVDA,
     SOXX, SPY, QQQ...), the first `len14` bars of each session read `%` (not
     yet `vwap_stdev_ready`) — no "12σ" spike at the open — then the VWAP Value
     row's numeric suffix switches to `(x.xxσ)`; tiers (BOUNCE/HEALTHY/
@@ -872,17 +860,16 @@ No test runner. After any edit, verify in the Pine Editor:
     sane hours/days into the session (not drifting toward a multi-day/
     multi-year baseline) — the accumulator resets on the calendar-day
     rollover as a fallback trigger specifically for this case.
-24. **Trade Signal verdict:** row right after Setup Score; `—` before any signal;
-    switches BUY↔SELL verdict on the same bar the new direction fires;
-    `WAIT (n/10)` under 10 resolved; `SKIP (CHOPPY)` when
-    `(W+L)/(W+L+U) < 0.40`; otherwise a bare `TRADE`/`CAUTION`/`SKIP` tiered by
-    the Wilson-adjusted rate (diverges from the raw rate at small `total`) —
-    no appended number; unaffected by `enablePnL`. Same verdict word also
-    appears in the header title (`SLT <VERSION> · <dir> <verdict> | PnL
-    <x%>`, plain gray background, unchanged) — check both update on the
-    same bar the row does, and that the header reads plain `SLT <VERSION>
-    | PnL —` before any signal has fired.
-25. **Index Data Proxy:** volume-less index → Profile row shows the auto-picked
+23. **Trade Signal verdict:** shown only in the header title (`SLT <VERSION> ·
+    <dir> <verdict> | PnL <x%>`, plain gray background) — no dedicated
+    dashboard row. `—`/absent before any signal; switches BUY↔SELL verdict on
+    the same bar the new direction fires; `WAIT (n/10)` under 10 resolved;
+    `SKIP (CHOPPY)` when `(W+L)/(W+L+U) < 0.40`; otherwise a bare
+    `TRADE`/`CAUTION`/`SKIP` tiered by the Wilson-adjusted rate (diverges from
+    the raw rate at small `total`) — no appended number; unaffected by
+    `enablePnL`. Header reads plain `SLT <VERSION> | PnL —` before any signal
+    has fired.
+24. **Index Data Proxy:** volume-less index → Profile row shows the auto-picked
     proxy (`NASDAQ:IXIC` → `· NASDAQ:QQQ data`), Volume row `proxy·TOD`, C2 scores
     non-zero. Unrecognized index (`TVC:DAX`) → orange `· ⚠️ volume-less → TWAP`,
     C2 falls back to session TWAP, C3 to the 1.0 floor. `SPY`/`QQQ`/`ES1!` → no
@@ -903,7 +890,12 @@ of the above, plus the Σ net-P&L figure (Net P&L rows in Extended Metrics).
 Concretely, V1 lacks Gate 5 entirely (only Gates 1-4), has no Initial Balance
 row, no P&L friction subtraction, fixed-% VWAP-distance thresholds only (no σ
 path), and no Net P&L rows — compare it against V2 on the same chart to see
-what each feature actually buys. (A separate single-EMA-anchor rebuild was also tried
+what each feature actually buys. **One divergence runs the other way:** `V1`
+still force-resolves a position still open at the trading-hours close (the
+day-end forced resolution mechanics — see HISTORY.md); that behavior was
+removed from `SLT.pine` (current `V2`) at user request, so a position open at
+the close now carries over unresolved (bucketed U) on `V2` but scores a
+same-day W/L on `V1`. (A separate single-EMA-anchor rebuild was also tried
 under the name "V2" earlier this session and parked after live results — see
 HISTORY.md; it was never committed and does not correspond to either file
 here.) The changelog is in
